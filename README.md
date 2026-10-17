@@ -17,7 +17,7 @@
 
 ## Features
 
-- **Multi-Account Management** – Add, rename, mask, import, export, and manage multiple Codex accounts in one place
+- **Multi-Account Management** – Add, rename, mask, import, export (full backups are passphrase-protected), and manage multiple Codex accounts in one place
 - **Quick Switching** – Switch between accounts from the main window, native tray menu, or tray popup while preserving rotated ChatGPT sessions
 - **Usage Stats** – View account usage stats for OAuth accounts, including lifetime tokens, daily buckets, streaks, activity insights, and top integrations
 - **Manual Reset Credits** – See available manual reset credits beside each account plan badge, with the closest expiry highlighted as it approaches
@@ -98,12 +98,33 @@ You can also serve the built dashboard over HTTP instead of opening the Tauri sh
 pnpm lan
 ```
 
+On startup the server prints an access URL:
+
+```text
+Open: http://localhost:3210/#token=<token>
+```
+
+The token is a secret. Anyone who has it can control your accounts, so do not share the URL or paste it into chats or screenshots. The page moves the token out of the address bar after loading, but the full `#token=` URL may already have been recorded in browser history or synced between devices. Prefer a private window, or clear that history entry afterwards. When the server is bound to `0.0.0.0` it prints an extra reminder that the dashboard is reachable from your network.
+
 Optional environment variables:
 
 - `CODEX_SWITCHER_WEB_HOST` to override the bind host
 - `CODEX_SWITCHER_WEB_PORT` to override the port
+- `CODEX_SWITCHER_WEB_TOKEN` to set your own token instead of a generated one. It must be at least 32 characters long and contain at least 8 distinct characters; weaker values are rejected at startup.
 
-The browser dashboard serves the same UI and backend actions through `/api/invoke/*`, which makes it usable over LAN, Tailscale, or a remote host tunnel when you expose the chosen port safely.
+The browser dashboard serves the same UI and backend actions through `/api/invoke/*`, which makes it usable over LAN, Tailscale, or a remote host tunnel.
+
+> **HTTP is cleartext.** The token and all account data cross the network unencrypted, so anyone on the path can read them. Do not expose the port on an untrusted network. Prefer keeping it on localhost and reaching it through `tailscale serve` or an SSH tunnel (`ssh -L 3210:localhost:3210 <host>`).
+
+Slim export is unavailable in web mode. Use the encrypted full backup instead.
+
+## Backups
+
+Full backups (`.cswf` files) are encrypted with a passphrase that you choose when you export:
+
+- The passphrase must be at least 12 characters long. There is no way to recover a backup if you forget it.
+- Importing a backup asks for the same passphrase.
+- Older backups created before passphrases were required still import: leave the passphrase blank. Those files are protected only by a key that is public in the source code, so they are effectively unencrypted. Re-export them with a passphrase and delete the old files.
 
 ## Usage and Reset Credits
 
