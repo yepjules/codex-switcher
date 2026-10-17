@@ -11,6 +11,8 @@ fn run() -> anyhow::Result<()> {
         .ok()
         .and_then(|value| value.parse::<u16>().ok())
         .unwrap_or(3210);
+    let token =
+        codex_switcher_lib::web::resolve_web_token(std::env::var("CODEX_SWITCHER_WEB_TOKEN").ok())?;
 
-    codex_switcher_lib::web::run_lan_server(&host, port)
+    codex_switcher_lib::web::run_lan_server(&host, port, token)
 }
