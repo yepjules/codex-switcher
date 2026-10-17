@@ -1,6 +1,7 @@
 //! Authentication module
 
 pub mod oauth_server;
+pub mod secure_fs;
 pub mod storage;
 pub mod switcher;
 pub mod token_refresh;
