@@ -6,7 +6,7 @@ import { SettingsModal } from "./components/SettingsModal";
 import { finishForceClose, type DesktopReopenPreference } from "./lib/desktopReopen";
 import type { CodexClosePreference } from "./lib/codexClosePreference";
 import { useForceCloseCodexProcesses } from "./hooks/useForceCloseCodexProcesses";
-import { AccountCard, AddAccountModal, UpdateChecker, WindowResizeBorders } from "./components";
+import { AccountCard, AddAccountModal, BackupPassphraseModal, UpdateChecker, WindowResizeBorders } from "./components";
 import type { AccountWithUsage, CodexProcessInfo, DockDisplayMode, UsageInfo } from "./types";
 import {
   exportFullBackupFile,
@@ -189,6 +189,9 @@ function App() {
 
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
   const [isConfigModalOpen, setIsConfigModalOpen] = useState(false);
+  const [backupPassphraseMode, setBackupPassphraseMode] = useState<
+    "export" | "import" | null
+  >(null);
   const [configModalMode, setConfigModalMode] = useState<"slim_export" | "slim_import">(
     "slim_export"
   );
@@ -1130,6 +1133,13 @@ function App() {
   }, [timedWarmupEnabled, timedWarmupRunning, timedWarmupTimes]);
 
   const handleExportSlimText = async () => {
+    if (!isTauriRuntime()) {
+      showWarmupToast(
+        "Slim export is unavailable in web mode; use the encrypted full backup",
+        true
+      );
+      return;
+    }
     setConfigModalMode("slim_export");
     setConfigModalError(null);
     setConfigPayload("");
@@ -1184,24 +1194,27 @@ function App() {
     }
   };
 
-  const handleExportFullFile = async () => {
+  const handleExportFullFile = async (passphrase: string) => {
     try {
       setIsExportingFull(true);
-      const exported = await exportFullBackupFile();
+      const exported = await exportFullBackupFile(passphrase);
       if (!exported) return;
       showWarmupToast("Full encrypted file exported.");
     } catch (err) {
       console.error("Failed to export full encrypted file:", err);
-      showWarmupToast("Full export failed", true);
+      showWarmupToast(
+        `Full export failed: ${err instanceof Error ? err.message : String(err)}`,
+        true
+      );
     } finally {
       setIsExportingFull(false);
     }
   };
 
-  const handleImportFullFile = async () => {
+  const handleImportFullFile = async (passphrase: string) => {
     try {
       setIsImportingFull(true);
-      const summary = await importFullBackupFile();
+      const summary = await importFullBackupFile(passphrase);
       if (!summary) return;
       const accountList = await loadAccounts();
       await refreshUsage(accountList);
@@ -1212,7 +1225,10 @@ function App() {
       );
     } catch (err) {
       console.error("Failed to import full encrypted file:", err);
-      showWarmupToast("Full import failed", true);
+      showWarmupToast(
+        `Full import failed: ${err instanceof Error ? err.message : String(err)}`,
+        true
+      );
     } finally {
       setIsImportingFull(false);
     }
@@ -1702,7 +1718,7 @@ function App() {
                     <button
                       onClick={() => {
                         setIsActionsMenuOpen(false);
-                        void handleExportFullFile();
+                        setBackupPassphraseMode("export");
                       }}
                       disabled={isExportingFull}
                       className="w-full rounded-lg px-3 py-2 text-left text-sm transition-colors hover:bg-gray-100 disabled:opacity-50 dark:text-white dark:hover:bg-neutral-900"
@@ -1712,7 +1728,7 @@ function App() {
                     <button
                       onClick={() => {
                         setIsActionsMenuOpen(false);
-                        void handleImportFullFile();
+                        setBackupPassphraseMode("import");
                       }}
                       disabled={isImportingFull}
                       className="w-full rounded-lg px-3 py-2 text-left text-sm transition-colors hover:bg-gray-100 disabled:opacity-50 dark:text-white dark:hover:bg-neutral-900"
@@ -2151,6 +2167,18 @@ function App() {
           </div>
         </div>
       )}
+
+      <BackupPassphraseModal
+        mode={backupPassphraseMode ?? "export"}
+        isOpen={backupPassphraseMode !== null}
+        onClose={() => setBackupPassphraseMode(null)}
+        onSubmit={(passphrase) => {
+          const mode = backupPassphraseMode;
+          setBackupPassphraseMode(null);
+          if (mode === "export") void handleExportFullFile(passphrase);
+          else if (mode === "import") void handleImportFullFile(passphrase);
+        }}
+      />
 
       {/* Add Account Modal */}
       <AddAccountModal
