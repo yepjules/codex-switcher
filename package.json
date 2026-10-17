@@ -4,6 +4,7 @@
   "version": "0.2.20",
   "description": "A multi-account manager for Codex CLI",
   "type": "module",
+  "packageManager": "pnpm@10.34.7",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
