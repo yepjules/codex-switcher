@@ -6,7 +6,7 @@ export function isTauriRuntime(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
 
-export const WEB_TOKEN_STORAGE_KEY = "codex-switcher-web-token";
+export const WEB_TOKEN_STORAGE_KEY = "codexSwitcherWebToken";
 
 const WEB_AUTH_ERROR =
   "Web access token missing or invalid \u2014 reopen the URL printed by codex-web";
@@ -25,32 +25,49 @@ export function isValidNewPassphrase(p: string): boolean {
   return [...p].length >= 12;
 }
 
+let memoryWebToken: string | null = null;
+
 function readStoredWebToken(): string | null {
   try {
-    return globalThis.sessionStorage?.getItem(WEB_TOKEN_STORAGE_KEY) ?? null;
+    const stored = globalThis.sessionStorage?.getItem(WEB_TOKEN_STORAGE_KEY);
+    if (stored) return stored;
   } catch {
-    return null;
+    // Storage unavailable (privacy mode); use the in-memory copy.
+  }
+  return memoryWebToken;
+}
+
+export function captureWebTokenFromLocation(
+  loc: { hash: string; pathname: string; search: string },
+  history: { replaceState(data: unknown, unused: string, url?: string | null): void },
+  storage: { setItem(key: string, value: string): void } | null | undefined
+): void {
+  if (!loc.hash.includes("token=")) return;
+  const token = extractTokenFromHash(loc.hash);
+  if (token) {
+    memoryWebToken = token;
+    try {
+      storage?.setItem(WEB_TOKEN_STORAGE_KEY, token);
+    } catch {
+      // Storage unavailable; the in-memory copy still authenticates this page.
+    }
+  }
+  try {
+    history.replaceState(null, "", loc.pathname + loc.search);
+  } catch {
+    // Ignore history failures.
   }
 }
 
 function captureWebTokenFromUrl(): void {
   if (typeof window === "undefined" || isTauriRuntime()) return;
-  const token = extractTokenFromHash(window.location.hash);
-  if (!token) return;
+  let storage: Storage | null = null;
   try {
-    window.sessionStorage.setItem(WEB_TOKEN_STORAGE_KEY, token);
+    storage = window.sessionStorage;
   } catch {
-    // Storage unavailable; the token is still stripped from the URL below.
+    storage = null;
   }
-  try {
-    window.history.replaceState(
-      null,
-      "",
-      window.location.pathname + window.location.search
-    );
-  } catch {
-    // Ignore history failures.
-  }
+  captureWebTokenFromLocation(window.location, window.history, storage);
 }
 
 captureWebTokenFromUrl();
