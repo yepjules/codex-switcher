@@ -208,7 +208,10 @@ mod tests {
         fs::write(&target, b"old").unwrap();
         std::os::unix::fs::symlink(&target, &link).unwrap();
         write_private_file(&link, b"x").unwrap();
-        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
         assert_eq!(fs::read_to_string(&target).unwrap(), "x");
         let _ = fs::remove_dir_all(&d);
     }

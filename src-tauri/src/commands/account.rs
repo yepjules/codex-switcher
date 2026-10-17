@@ -3,7 +3,7 @@
 use crate::auth::{
     add_account, create_chatgpt_account_from_refresh_token, ensure_chatgpt_tokens_fresh_locked,
     get_active_account, import_from_auth_json, import_from_auth_json_contents, load_accounts,
-    read_current_auth, remove_account, save_accounts, set_active_account, switch_to_account,
+    mutate_accounts, read_current_auth, remove_account, set_active_account, switch_to_account,
     sync_active_account_tokens, touch_account, AUTH_OPERATION_LOCK,
 };
 use crate::types::{AccountInfo, AccountsStore, AuthData, ImportAccountsSummary, StoredAccount};
@@ -140,7 +140,7 @@ pub async fn switch_account(account_id: String) -> Result<(), String> {
 
 pub async fn switch_account_by_id(account_id: &str) -> Result<(), String> {
     let _auth_guard = AUTH_OPERATION_LOCK.lock().await;
-    let mut store = load_accounts().map_err(|e| e.to_string())?;
+    let store = load_accounts().map_err(|e| e.to_string())?;
 
     let target_index = store
         .accounts
@@ -156,13 +156,19 @@ pub async fn switch_account_by_id(account_id: &str) -> Result<(), String> {
 
     // ChatGPT rotates single-use refresh tokens. Preserve the latest token
     // before replacing auth.json, otherwise switching back restores a stale one.
+    let mut target = store.accounts[target_index].clone();
     if let Some(auth) = read_current_auth().map_err(|e| e.to_string())? {
-        if sync_active_account_tokens(&mut store, &auth) {
-            save_accounts(&store).map_err(|e| e.to_string())?;
+        let refreshed_target = mutate_accounts(|store| {
+            sync_active_account_tokens(store, &auth);
+            Ok(store.accounts.iter().find(|a| a.id == account_id).cloned())
+        })
+        .map_err(|e| e.to_string())?;
+        if let Some(refreshed_target) = refreshed_target {
+            target = refreshed_target;
         }
     }
 
-    let account = ensure_chatgpt_tokens_fresh_locked(&store.accounts[target_index])
+    let account = ensure_chatgpt_tokens_fresh_locked(&target)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -239,8 +245,14 @@ pub async fn import_accounts_slim_text(payload: String) -> Result<ImportAccounts
         })?;
     validate_imported_store(&imported).map_err(|e| format!("{e:#}"))?;
 
-    let (merged, summary) = merge_accounts_store(current, imported);
-    save_accounts(&merged).map_err(|e| e.to_string())?;
+    // `existing_names` came from a pre-network snapshot; the merge re-checks
+    // duplicates against the fresh store under the lock, so that is safe.
+    let summary = mutate_accounts(|current| {
+        let (merged, summary) = merge_accounts_store(std::mem::take(current), imported);
+        *current = merged;
+        Ok(summary)
+    })
+    .map_err(|e| e.to_string())?;
     Ok(ImportAccountsSummary {
         total_in_payload,
         imported_count: summary.imported_count,
@@ -274,10 +286,12 @@ pub async fn import_accounts_full_encrypted_file(
         .map_err(|e| e.to_string())?;
     validate_imported_store(&imported).map_err(|e| e.to_string())?;
 
-    let current = load_accounts().map_err(|e| e.to_string())?;
-    let (merged, summary) = merge_accounts_store(current, imported);
-    save_accounts(&merged).map_err(|e| e.to_string())?;
-    Ok(summary)
+    mutate_accounts(|current| {
+        let (merged, summary) = merge_accounts_store(std::mem::take(current), imported);
+        *current = merged;
+        Ok(summary)
+    })
+    .map_err(|e| e.to_string())
 }
 
 /// Import full account config from encrypted bytes uploaded through the browser UI.
@@ -288,10 +302,12 @@ pub async fn import_accounts_full_encrypted_bytes(
         decode_full_encrypted_store(&bytes, FULL_PRESET_PASSPHRASE).map_err(|e| e.to_string())?;
     validate_imported_store(&imported).map_err(|e| e.to_string())?;
 
-    let current = load_accounts().map_err(|e| e.to_string())?;
-    let (merged, summary) = merge_accounts_store(current, imported);
-    save_accounts(&merged).map_err(|e| e.to_string())?;
-    Ok(summary)
+    mutate_accounts(|current| {
+        let (merged, summary) = merge_accounts_store(std::mem::take(current), imported);
+        *current = merged;
+        Ok(summary)
+    })
+    .map_err(|e| e.to_string())
 }
 
 /// Find all running Antigravity codex assistant processes
@@ -655,16 +671,8 @@ fn decompress_bytes_with_limit(input: &[u8], max_bytes: u64) -> anyhow::Result<V
 }
 
 fn write_encrypted_file(path: &str, bytes: &[u8]) -> anyhow::Result<()> {
-    fs::write(path, bytes).with_context(|| format!("Failed to write file: {path}"))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("Failed to set file permissions: {path}"))?;
-    }
-
-    Ok(())
+    crate::auth::secure_fs::write_private_file(std::path::Path::new(path), bytes)
+        .with_context(|| format!("Failed to write file: {path}"))
 }
 
 fn read_encrypted_file(path: &str) -> anyhow::Result<Vec<u8>> {
@@ -705,7 +713,7 @@ fn validate_imported_store(store: &AccountsStore) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn merge_accounts_store(
+pub(crate) fn merge_accounts_store(
     mut current: AccountsStore,
     imported: AccountsStore,
 ) -> (AccountsStore, ImportAccountsSummary) {
