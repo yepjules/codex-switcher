@@ -127,6 +127,9 @@ mod ssl;
 mod test;
 mod util;
 
+/// codex-switcher patch: read/write timeout applied to every accepted socket.
+pub const DEFAULT_SOCKET_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// The main class of this library.
 ///
 /// Destroying this object will immediately close the listening socket and the reading
@@ -203,6 +206,19 @@ impl Server {
         })
     }
 
+    /// codex-switcher patch: like `http`, with an explicit read/write timeout for
+    /// accepted sockets instead of `DEFAULT_SOCKET_TIMEOUT`.
+    pub fn http_with_timeout<A>(
+        addr: A,
+        timeout: Duration,
+    ) -> Result<Server, Box<dyn Error + Send + Sync + 'static>>
+    where
+        A: ToSocketAddrs,
+    {
+        let listener = ConfigListenAddr::from_socket_addrs(addr)?.bind()?;
+        Self::from_listener_with_timeout(listener, None, timeout)
+    }
+
     /// Shortcut for an HTTPS server on a specific address.
     #[cfg(any(feature = "ssl-openssl", feature = "ssl-rustls"))]
     #[inline]
@@ -244,6 +260,15 @@ impl Server {
     pub fn from_listener<L: Into<Listener>>(
         listener: L,
         ssl_config: Option<SslConfig>,
+    ) -> Result<Server, Box<dyn Error + Send + Sync + 'static>> {
+        Self::from_listener_with_timeout(listener, ssl_config, DEFAULT_SOCKET_TIMEOUT)
+    }
+
+    /// codex-switcher patch: `from_listener` with an explicit socket read/write timeout.
+    pub fn from_listener_with_timeout<L: Into<Listener>>(
+        listener: L,
+        ssl_config: Option<SslConfig>,
+        socket_timeout: Duration,
     ) -> Result<Server, Box<dyn Error + Send + Sync + 'static>> {
         let listener = listener.into();
         // building the "close" variable
@@ -295,6 +320,10 @@ impl Server {
             while !inside_close_trigger.load(Relaxed) {
                 let new_client = match server.accept() {
                     Ok((sock, _)) => {
+                        // codex-switcher patch: bound blocking reads/writes so an idle
+                        // client cannot stall a thread forever (header read, body read,
+                        // body drain on drop, or response write).
+                        sock.set_timeouts(Some(socket_timeout));
                         use util::RefinedTcpStream;
                         let (read_closable, write_closable) = match ssl {
                             None => RefinedTcpStream::new(sock),

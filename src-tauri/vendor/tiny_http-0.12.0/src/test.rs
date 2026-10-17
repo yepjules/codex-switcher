@@ -73,6 +73,7 @@ impl From<TestRequest> for Request {
             Some(mock.remote_addr),
             mock.body.as_bytes(),
             std::io::sink(),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
         .unwrap()
     }

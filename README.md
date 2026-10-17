@@ -110,11 +110,13 @@ Optional environment variables:
 
 - `CODEX_SWITCHER_WEB_HOST` to override the bind host
 - `CODEX_SWITCHER_WEB_PORT` to override the port
-- `CODEX_SWITCHER_WEB_TOKEN` to set your own token instead of a generated one. It must be at least 32 characters long and contain at least 8 distinct characters; weaker values are rejected at startup.
+- `CODEX_SWITCHER_WEB_TOKEN` to set your own token instead of a generated one. It must be at least 32 characters long and contain at least 8 distinct characters, using only `A-Z a-z 0-9 . _ ~ -`; other values are rejected at startup.
 
 The browser dashboard serves the same UI and backend actions through `/api/invoke/*`, which makes it usable over LAN, Tailscale, or a remote host tunnel.
 
 > **HTTP is cleartext.** The token and all account data cross the network unencrypted, so anyone on the path can read them. Do not expose the port on an untrusted network. Prefer keeping it on localhost and reaching it through `tailscale serve` or an SSH tunnel (`ssh -L 3210:localhost:3210 <host>`).
+
+> **Reverse proxies:** if a proxy (for example `tailscale serve`) rewrites the `Host` header, browser requests can be rejected with `403` by the Origin check. If that happens, use the machine's tailnet address directly or an SSH tunnel.
 
 Slim export is unavailable in web mode. Use the encrypted full backup instead.
 

@@ -2,6 +2,8 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+use std::thread::JoinHandle;
 
 use anyhow::Context;
 use base64::{
@@ -97,6 +99,17 @@ pub fn resolve_web_token(env_value: Option<String>) -> anyhow::Result<String> {
             Ok(URL_SAFE_NO_PAD.encode(bytes))
         }
         Some(value) => {
+            // The token is printed into a URL fragment and sent back in an HTTP header,
+            // so only unreserved URL characters survive both unchanged. The value is
+            // never echoed in the error.
+            if !value
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '~' | '-'))
+            {
+                anyhow::bail!(
+                    "CODEX_SWITCHER_WEB_TOKEN may only contain the characters A-Z a-z 0-9 . _ ~ - (no spaces, newlines or other symbols)"
+                );
+            }
             let distinct: HashSet<char> = value.chars().collect();
             if value.chars().count() < 32 || distinct.len() < 8 {
                 anyhow::bail!(
@@ -190,11 +203,33 @@ fn static_security_headers() -> Vec<Header> {
     .collect()
 }
 
+/// Number of threads that take requests off the shared queue. One slow or hostile
+/// client then cannot hold up every other client.
+const HANDLER_THREADS: usize = 4;
+
+/// Formats `host:port` so `ToSocketAddrs` accepts IPv6 literals (`[::1]:3210`).
+fn bind_address(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+/// Host to show in the startup URL: wildcard binds print `localhost`, IPv6 literals get brackets.
+fn display_host(host: &str) -> (String, bool) {
+    match host {
+        "0.0.0.0" | "::" | "[::]" => ("localhost".to_string(), true),
+        h if h.contains(':') && !h.starts_with('[') => (format!("[{h}]"), false),
+        h => (h.to_string(), false),
+    }
+}
+
 pub fn run_lan_server(host: &str, port: u16, token: String) -> anyhow::Result<()> {
     if let Err(err) = crate::auth::harden_config_permissions() {
         eprintln!("[Startup] Failed to harden config permissions: {err:#}");
     }
-    let address = format!("{host}:{port}");
+    let address = bind_address(host, port);
     let server = Server::http(&address)
         .map_err(|err| anyhow::anyhow!("Failed to bind HTTP server on {address}: {err}"))?;
     let runtime = Runtime::new().context("Failed to start async runtime")?;
@@ -204,21 +239,53 @@ pub fn run_lan_server(host: &str, port: u16, token: String) -> anyhow::Result<()
 
     println!("Codex Switcher web server listening on http://{address}");
     println!("Serving static files from {}", dist_dir.display());
-    let display_host = if host == "0.0.0.0" { "localhost" } else { host };
-    println!("Open: http://{display_host}:{port}/#token={token}");
-    if host == "0.0.0.0" {
+    let (shown_host, wildcard) = display_host(host);
+    println!("Open: http://{shown_host}:{port}/#token={token}");
+    if wildcard {
         println!(
             "Listening on all interfaces — replace localhost with this machine's LAN or tailnet address"
         );
     }
 
-    for request in server.incoming_requests() {
-        if let Err(error) = handle_request(request, &runtime, &dist_dir, &token) {
-            eprintln!("[web] request failed: {error:#}");
-        }
+    let workers = spawn_request_handlers(
+        Arc::new(server),
+        Arc::new(runtime),
+        Arc::new(dist_dir),
+        Arc::from(token),
+        HANDLER_THREADS,
+    );
+    for worker in workers {
+        let _ = worker.join();
     }
 
     Ok(())
+}
+
+/// Starts `count` threads that each pull requests from the shared server queue.
+fn spawn_request_handlers(
+    server: Arc<Server>,
+    runtime: Arc<Runtime>,
+    dist_dir: Arc<PathBuf>,
+    token: Arc<str>,
+    count: usize,
+) -> Vec<JoinHandle<()>> {
+    (0..count)
+        .map(|_| {
+            let (server, runtime, dist_dir, token) = (
+                server.clone(),
+                runtime.clone(),
+                dist_dir.clone(),
+                token.clone(),
+            );
+            std::thread::spawn(move || {
+                for request in server.incoming_requests() {
+                    if let Err(error) = handle_request(request, &runtime, &dist_dir, &token) {
+                        eprintln!("[web] request failed: {error:#}");
+                    }
+                }
+            })
+        })
+        .collect()
 }
 
 fn handle_request(
@@ -388,7 +455,10 @@ fn serve_static(request: Request, dist_dir: &Path, url: &str) -> anyhow::Result<
     let requested = if url == "/" {
         PathBuf::from("index.html")
     } else {
-        sanitize_path(url)?
+        match sanitize_path(url) {
+            Ok(path) => path,
+            Err(_) => return respond_not_found(request),
+        }
     };
     let candidate = dist_dir.join(&requested);
 
@@ -397,16 +467,19 @@ fn serve_static(request: Request, dist_dir: &Path, url: &str) -> anyhow::Result<
     }
 
     if requested.extension().is_some() {
-        respond_text(
-            request,
-            StatusCode(404),
-            "Not Found",
-            "text/plain; charset=utf-8",
-        )?;
-        return Ok(());
+        return respond_not_found(request);
     }
 
     serve_file(request, dist_dir.join("index.html"))
+}
+
+fn respond_not_found(request: Request) -> anyhow::Result<()> {
+    respond_text(
+        request,
+        StatusCode(404),
+        "Not Found",
+        "text/plain; charset=utf-8",
+    )
 }
 
 fn sanitize_path(url: &str) -> anyhow::Result<PathBuf> {
@@ -425,7 +498,13 @@ fn sanitize_path(url: &str) -> anyhow::Result<PathBuf> {
 }
 
 fn serve_file(request: Request, path: PathBuf) -> anyhow::Result<()> {
-    let data = fs::read(&path).with_context(|| format!("Failed to read {}", path.display()))?;
+    let data = match fs::read(&path) {
+        Ok(data) => data,
+        Err(error) => {
+            eprintln!("[web] failed to read {}: {error}", path.display());
+            return respond_not_found(request);
+        }
+    };
     let mime = mime_type_for_path(&path);
     let mut response = Response::from_data(data)
         .with_header(header("Content-Type", mime)?)
@@ -719,18 +798,62 @@ mod tests {
         assert!(resolve_web_token(Some(low)).is_err());
     }
 
-    fn start_test_server() -> (std::sync::Arc<Server>, std::net::SocketAddr) {
-        let server = std::sync::Arc::new(Server::http("127.0.0.1:0").unwrap());
+    fn start_test_server() -> (Arc<Server>, std::net::SocketAddr) {
+        start_test_server_on(Server::http("127.0.0.1:0").unwrap())
+    }
+
+    /// Runs the production handler pool on `server` with the test token.
+    fn start_test_server_on(server: Server) -> (Arc<Server>, std::net::SocketAddr) {
+        let server = Arc::new(server);
         let addr = server.server_addr().to_ip().unwrap();
-        let worker = server.clone();
-        std::thread::spawn(move || {
-            let runtime = Runtime::new().unwrap();
-            let dist = std::env::temp_dir();
-            for request in worker.incoming_requests() {
-                let _ = handle_request(request, &runtime, &dist, T);
-            }
-        });
+        spawn_request_handlers(
+            server.clone(),
+            Arc::new(Runtime::new().unwrap()),
+            Arc::new(std::env::temp_dir()),
+            Arc::from(T),
+            HANDLER_THREADS,
+        );
         (server, addr)
+    }
+
+    fn stop(server: &Server) {
+        for _ in 0..HANDLER_THREADS {
+            server.unblock();
+        }
+    }
+
+    fn connect(addr: std::net::SocketAddr) -> std::net::TcpStream {
+        let stream = std::net::TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        stream
+    }
+
+    /// Reads one chunk and returns its first line (the status line of a response).
+    fn read_status_line(stream: &mut std::net::TcpStream) -> String {
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).unwrap_or(0);
+        String::from_utf8_lossy(&buf[..n])
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// Reads until the peer closes (`true`) or the read times out (`false`).
+    fn read_until_close(stream: &mut std::net::TcpStream) -> (String, bool) {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 4096];
+        let closed = loop {
+            match stream.read(&mut buf) {
+                Ok(0) => break true,
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => break true,
+                Err(_) => break false,
+            }
+        };
+        (String::from_utf8_lossy(&out).to_string(), closed)
     }
 
     fn raw_status(addr: std::net::SocketAddr, request: &str) -> String {
@@ -763,7 +886,7 @@ mod tests {
             let second = raw_status(addr, "GET /api/health HTTP/1.1\r\nHost: x\r\n\r\n");
             assert!(second.contains("200"), "{second}");
         }
-        server.unblock();
+        stop(&server);
     }
 
     #[test]
@@ -783,6 +906,174 @@ mod tests {
         assert!(lower.starts_with("http/1.1 405"), "{text}");
         assert!(lower.contains("content-security-policy:"), "{text}");
         assert!(lower.contains("x-frame-options: deny"), "{text}");
-        server.unblock();
+        stop(&server);
+    }
+
+    #[test]
+    fn idle_declared_body_does_not_stall_other_clients() {
+        use std::io::Write;
+        let (server, addr) = start_test_server();
+        // More idle attackers than handler threads: each declares an in-budget body,
+        // sends none and keeps the socket open.
+        let mut idle = Vec::new();
+        for _ in 0..HANDLER_THREADS + 1 {
+            let mut stream = connect(addr);
+            stream
+                .write_all(b"POST /api/invoke/list_accounts HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 2000000\r\n\r\n")
+                .unwrap();
+            let status = read_status_line(&mut stream);
+            assert!(status.contains("401"), "{status}");
+            idle.push(stream);
+        }
+        let started = std::time::Instant::now();
+        let health = raw_status(addr, "GET /api/health HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(health.contains("200"), "{health}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "health took {:?}",
+            started.elapsed()
+        );
+        drop(idle);
+        stop(&server);
+    }
+
+    #[test]
+    fn oversized_declared_body_closes_connection_instead_of_parsing_it() {
+        use std::io::Write;
+        let (server, addr) = start_test_server();
+        // Above the drain budget the body is skipped; the bytes that follow must not be
+        // parsed as a second request on the same connection.
+        let mut stream = connect(addr);
+        stream
+            .write_all(b"POST /api/invoke/list_accounts HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 20000000\r\n\r\nGET /api/health HTTP/1.1\r\nHost: x\r\n\r\n")
+            .unwrap();
+        let (text, closed) = read_until_close(&mut stream);
+        assert!(text.starts_with("HTTP/1.1 401"), "{text}");
+        assert!(
+            !text.contains("HTTP/1.1 200"),
+            "smuggled request answered: {text}"
+        );
+        assert!(closed, "connection left open after skipped body");
+        let health = raw_status(addr, "GET /api/health HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(health.contains("200"), "{health}");
+        stop(&server);
+    }
+
+    #[test]
+    fn partial_body_then_reuse_closes_connection() {
+        use std::io::Write;
+        // Short socket timeout so the stalled drain gives up quickly.
+        let (server, addr) = start_test_server_on(
+            Server::http_with_timeout("127.0.0.1:0", std::time::Duration::from_millis(500))
+                .unwrap(),
+        );
+        let mut stream = connect(addr);
+        stream
+            .write_all(b"POST /api/invoke/list_accounts HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 2000\r\n\r\n0123456789")
+            .unwrap();
+        let status = read_status_line(&mut stream);
+        assert!(status.contains("401"), "{status}");
+        // Try to reuse the connection while the declared body is still incomplete.
+        stream
+            .write_all(b"GET /api/health HTTP/1.1\r\nHost: x\r\n\r\n")
+            .unwrap();
+        let (rest, closed) = read_until_close(&mut stream);
+        assert!(
+            !rest.contains("HTTP/1.1"),
+            "answered on a desynced connection: {rest}"
+        );
+        assert!(closed, "connection left open after incomplete body");
+        let health = raw_status(addr, "GET /api/health HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(health.contains("200"), "{health}");
+        stop(&server);
+    }
+
+    #[test]
+    fn complete_body_keeps_connection_usable() {
+        use std::io::Write;
+        // Control for the poisoning tests: a fully sent body leaves keep-alive intact.
+        let (server, addr) = start_test_server();
+        let mut stream = connect(addr);
+        let body = "x".repeat(2000);
+        stream
+            .write_all(
+                format!(
+                    "POST /api/invoke/list_accounts HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 2000\r\n\r\n{body}"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let status = read_status_line(&mut stream);
+        assert!(status.contains("401"), "{status}");
+        stream
+            .write_all(b"GET /api/health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let (rest, _) = read_until_close(&mut stream);
+        assert!(rest.contains("HTTP/1.1 200"), "{rest}");
+        stop(&server);
+    }
+
+    #[test]
+    fn socket_gate_rejects_missing_token_and_wrong_content_type() {
+        let (server, addr) = start_test_server();
+        let no_token = raw_status(
+            addr,
+            "POST /api/invoke/list_accounts HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+        );
+        assert!(no_token.contains("401"), "{no_token}");
+        let text_plain = raw_status(
+            addr,
+            &format!(
+                "POST /api/invoke/list_accounts HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {T}\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\n{{}}"
+            ),
+        );
+        assert!(text_plain.contains("415"), "{text_plain}");
+        stop(&server);
+    }
+
+    #[test]
+    fn invalid_static_path_is_404_with_security_headers() {
+        use std::io::Write;
+        let (server, addr) = start_test_server();
+        let mut stream = connect(addr);
+        stream
+            .write_all(b"GET /a/../b HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let (text, _) = read_until_close(&mut stream);
+        let lower = text.to_ascii_lowercase();
+        assert!(lower.starts_with("http/1.1 404"), "{text}");
+        assert!(lower.contains("content-security-policy:"), "{text}");
+        assert!(lower.contains("x-content-type-options: nosniff"), "{text}");
+        stop(&server);
+    }
+
+    #[test]
+    fn env_token_charset_is_restricted_and_not_echoed() {
+        let base = "abcdefghijABCDEFGHIJ0123456789";
+        for bad in ["+", "&", "#", "%", " ", "\n", "/", "=", "é"] {
+            let value = format!("{base}{bad}xyz");
+            let err = resolve_web_token(Some(value.clone()))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("may only contain"), "{bad:?}: {err}");
+            assert!(!err.contains(base), "error echoes the token: {err}");
+        }
+        assert!(resolve_web_token(Some(format!("{base}.-_~"))).is_ok());
+    }
+
+    #[test]
+    fn startup_url_host_formatting() {
+        assert_eq!(display_host("0.0.0.0"), ("localhost".to_string(), true));
+        assert_eq!(display_host("::"), ("localhost".to_string(), true));
+        assert_eq!(display_host("::1"), ("[::1]".to_string(), false));
+        assert_eq!(display_host("fd7a::5"), ("[fd7a::5]".to_string(), false));
+        assert_eq!(display_host("127.0.0.1"), ("127.0.0.1".to_string(), false));
+        assert_eq!(
+            display_host("mybox.local"),
+            ("mybox.local".to_string(), false)
+        );
+        assert_eq!(bind_address("::", 3210), "[::]:3210");
+        assert_eq!(bind_address("[::1]", 3210), "[::1]:3210");
+        assert_eq!(bind_address("0.0.0.0", 3210), "0.0.0.0:3210");
     }
 }

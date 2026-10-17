@@ -6,11 +6,35 @@ use std::io::{BufReader, BufWriter, ErrorKind, Read};
 
 use std::net::SocketAddr;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use crate::common::{HTTPVersion, Method};
 use crate::util::RefinedTcpStream;
 use crate::util::{SequentialReader, SequentialReaderBuilder, SequentialWriterBuilder};
 use crate::Request;
+
+/// codex-switcher patch: socket reader that refuses to read once the connection is
+/// poisoned (a request body was not fully consumed), so leftover body bytes are never
+/// parsed as the next request. `ClientConnection` then ends and the socket closes.
+struct GuardedReader<R> {
+    inner: R,
+    poison: Arc<AtomicBool>,
+}
+
+impl<R: Read> Read for GuardedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
+        if self.poison.load(Ordering::SeqCst) {
+            return Err(IoError::new(
+                ErrorKind::ConnectionAborted,
+                "previous request body was not fully consumed",
+            ));
+        }
+        self.inner.read(buf)
+    }
+}
+
+type ConnReader = GuardedReader<BufReader<RefinedTcpStream>>;
 
 /// A ClientConnection is an object that will store a socket to a client
 /// and return Request objects.
@@ -20,20 +44,23 @@ pub struct ClientConnection {
 
     // sequence of Readers to the stream, so that the data is not read in
     //  the wrong order
-    source: SequentialReaderBuilder<BufReader<RefinedTcpStream>>,
+    source: SequentialReaderBuilder<ConnReader>,
 
     // sequence of Writers to the stream, to avoid writing response #2 before
     //  response #1
     sink: SequentialWriterBuilder<BufWriter<RefinedTcpStream>>,
 
     // Reader to read the next header from
-    next_header_source: SequentialReader<BufReader<RefinedTcpStream>>,
+    next_header_source: SequentialReader<ConnReader>,
 
     // set to true if we know that the previous request is the last one
     no_more_requests: bool,
 
     // true if the connection goes through SSL
     secure: bool,
+
+    // codex-switcher patch: shared with each request's body reader; see GuardedReader
+    poison: Arc<AtomicBool>,
 }
 
 /// Error that can happen when reading a request.
@@ -55,7 +82,11 @@ impl ClientConnection {
         let remote_addr = read_socket.peer_addr();
         let secure = read_socket.secure();
 
-        let mut source = SequentialReaderBuilder::new(BufReader::with_capacity(1024, read_socket));
+        let poison = Arc::new(AtomicBool::new(false));
+        let mut source = SequentialReaderBuilder::new(GuardedReader {
+            inner: BufReader::with_capacity(1024, read_socket),
+            poison: poison.clone(),
+        });
         let first_header = source.next().unwrap();
 
         ClientConnection {
@@ -65,6 +96,7 @@ impl ClientConnection {
             next_header_source: first_header,
             no_more_requests: false,
             secure,
+            poison,
         }
     }
 
@@ -153,6 +185,7 @@ impl ClientConnection {
             *self.remote_addr.as_ref().unwrap(),
             data_source,
             writer,
+            self.poison.clone(),
         )
         .map_err(|e| {
             use crate::request;
@@ -258,6 +291,12 @@ impl Iterator for ClientConnection {
                 None if *rq.http_version() == HTTPVersion(1, 0) => self.no_more_requests = true,
                 _ => (),
             };
+
+            // codex-switcher patch: an unread chunked body is never drained, so its
+            // leftover bytes would be parsed as the next request. Close after this one.
+            if rq.headers().iter().any(|h| h.field.equiv("Transfer-Encoding")) {
+                self.no_more_requests = true;
+            }
 
             // returning the request
             return Some(rq);

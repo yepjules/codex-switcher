@@ -5,7 +5,9 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::str::FromStr;
 
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::Sender;
+use std::sync::Arc;
 
 use crate::util::{EqualReader, FusedReader};
 use crate::{HTTPVersion, Header, Method, Response, StatusCode};
@@ -135,6 +137,7 @@ pub fn new_request<R, W>(
     remote_addr: Option<SocketAddr>,
     mut source_data: R,
     writer: W,
+    poison: Arc<AtomicBool>,
 ) -> Result<Request, RequestCreationError>
 where
     R: Read + Send + 'static,
@@ -212,7 +215,7 @@ where
 
             Box::new(Cursor::new(buffer)) as Box<dyn Read + Send + 'static>
         } else {
-            let (data_reader, _) = EqualReader::new(source_data, content_length); // TODO:
+            let (data_reader, _) = EqualReader::new(source_data, content_length, poison); // TODO:
             Box::new(FusedReader::new(data_reader)) as Box<dyn Read + Send + 'static>
         }
     } else if transfer_encoding.is_some() {
@@ -492,6 +495,18 @@ impl Drop for Request {
             let _ = self.respond_impl(response); // ignoring any potential error
             if let Some(sender) = self.notify_when_responded.take() {
                 sender.send(()).unwrap();
+            }
+        }
+        // codex-switcher patch: dropping a body reader drains whatever the handler did
+        // not read, which can block on a slow or idle client for up to the drain
+        // deadline. Do that off the caller's (handler) thread so one client cannot
+        // occupy it; the connection's own thread waits for the drain as before.
+        if self.body_length.map_or(false, |len| len > 0) {
+            if let Some(reader) = self.data_reader.take() {
+                // If the spawn fails the closure (and the reader) is dropped inline.
+                let _ = std::thread::Builder::new()
+                    .name("tiny-http-drain".into())
+                    .spawn(move || drop(reader));
             }
         }
     }
