@@ -51,3 +51,6 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Securit
 # Temporary backport of tray-icon PR #365: macOS 27 can swallow left-clicks while an NSMenu stays attached.
 # Remove this entry and vendor/tray-icon-0.21.3 once Tauri resolves to tray-icon >= 0.25.1 (or another release containing that fix), then refresh Cargo.lock.
 tray-icon = { path = "vendor/tray-icon-0.21.3" }
+# Local patch of tiny_http 0.12.0: EqualReader::drop allocated a buffer sized by the client-declared Content-Length, so one unauthenticated request with a huge value aborted the process (it also affects the OAuth callback server).
+# Remove this entry and vendor/tiny_http-0.12.0 once an upstream tiny_http release bounds that drain, then refresh Cargo.lock.
+tiny_http = { path = "vendor/tiny_http-0.12.0" }

@@ -186,7 +186,7 @@ fn static_security_headers() -> Vec<Header> {
         ("X-Frame-Options", "DENY"),
     ]
     .into_iter()
-    .filter_map(|(name, value)| header(name, value).ok())
+    .map(|(name, value)| header(name, value).expect("static header is valid"))
     .collect()
 }
 
@@ -457,9 +457,12 @@ fn respond_text(
     body: &str,
     content_type: &str,
 ) -> anyhow::Result<()> {
-    let response = Response::from_string(body.to_string())
+    let mut response = Response::from_string(body.to_string())
         .with_status_code(status)
         .with_header(header("Content-Type", content_type)?);
+    for security_header in static_security_headers() {
+        response.add_header(security_header);
+    }
     request.respond(response)?;
     Ok(())
 }
@@ -697,5 +700,89 @@ mod tests {
             .to_string()
             .contains("at least 32 characters with at least 8 distinct characters"));
         assert!(resolve_web_token(Some("abcdefghij".repeat(4))).is_ok());
+    }
+
+    #[test]
+    fn token_length_and_diversity_boundaries() {
+        // 31 chars, 8 distinct: too short.
+        let short = format!("{}{}", "abcdefgh".repeat(3), "abcdefg");
+        assert_eq!(short.chars().count(), 31);
+        assert!(resolve_web_token(Some(short)).is_err());
+        // 32 chars, exactly 8 distinct: accepted.
+        let exact = "abcdefgh".repeat(4);
+        assert_eq!(exact.chars().count(), 32);
+        assert!(resolve_web_token(Some(exact)).is_ok());
+        // 32 chars, 7 distinct: rejected.
+        let low = format!("{}{}", "abcdefg".repeat(4), "abcd");
+        assert_eq!(low.chars().count(), 32);
+        assert_eq!(low.chars().collect::<HashSet<_>>().len(), 7);
+        assert!(resolve_web_token(Some(low)).is_err());
+    }
+
+    fn start_test_server() -> (std::sync::Arc<Server>, std::net::SocketAddr) {
+        let server = std::sync::Arc::new(Server::http("127.0.0.1:0").unwrap());
+        let addr = server.server_addr().to_ip().unwrap();
+        let worker = server.clone();
+        std::thread::spawn(move || {
+            let runtime = Runtime::new().unwrap();
+            let dist = std::env::temp_dir();
+            for request in worker.incoming_requests() {
+                let _ = handle_request(request, &runtime, &dist, T);
+            }
+        });
+        (server, addr)
+    }
+
+    fn raw_status(addr: std::net::SocketAddr, request: &str) -> String {
+        use std::io::Write;
+        let mut stream = std::net::TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).unwrap();
+        String::from_utf8_lossy(&buf[..n])
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[test]
+    fn huge_content_length_does_not_crash_server() {
+        let (server, addr) = start_test_server();
+        for declared in ["18446744073709551615", "9223372036854775807"] {
+            let first = raw_status(
+                addr,
+                &format!(
+                    "POST /api/invoke/list_accounts HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {declared}\r\n\r\n"
+                ),
+            );
+            assert!(first.contains("401"), "{first}");
+            let second = raw_status(addr, "GET /api/health HTTP/1.1\r\nHost: x\r\n\r\n");
+            assert!(second.contains("200"), "{second}");
+        }
+        server.unblock();
+    }
+
+    #[test]
+    fn error_responses_carry_security_headers() {
+        use std::io::Write;
+        let (server, addr) = start_test_server();
+        let mut stream = std::net::TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        stream
+            .write_all(b"PUT /x HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut text = String::new();
+        stream.read_to_string(&mut text).unwrap();
+        let lower = text.to_ascii_lowercase();
+        assert!(lower.starts_with("http/1.1 405"), "{text}");
+        assert!(lower.contains("content-security-policy:"), "{text}");
+        assert!(lower.contains("x-frame-options: deny"), "{text}");
+        server.unblock();
     }
 }

@@ -280,8 +280,7 @@ pub async fn export_accounts_full_encrypted_file(
 ) -> Result<(), String> {
     validate_new_passphrase(&passphrase).map_err(|e| e.to_string())?;
     let store = load_accounts().map_err(|e| e.to_string())?;
-    let encrypted =
-        encode_full_v2(&store, &passphrase, FULL_KDF_ITERATIONS_V2).map_err(|e| e.to_string())?;
+    let encrypted = encode_full_v2_blocking(store, passphrase).await?;
     write_encrypted_file(&path, &encrypted).map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -290,7 +289,29 @@ pub async fn export_accounts_full_encrypted_file(
 pub async fn export_accounts_full_encrypted_bytes(passphrase: String) -> Result<Vec<u8>, String> {
     validate_new_passphrase(&passphrase).map_err(|e| e.to_string())?;
     let store = load_accounts().map_err(|e| e.to_string())?;
-    encode_full_v2(&store, &passphrase, FULL_KDF_ITERATIONS_V2).map_err(|e| e.to_string())
+    encode_full_v2_blocking(store, passphrase).await
+}
+
+/// PBKDF2 at 600k iterations is CPU-heavy; keep it off the async worker threads.
+async fn encode_full_v2_blocking(
+    store: AccountsStore,
+    passphrase: String,
+) -> Result<Vec<u8>, String> {
+    tokio::task::spawn_blocking(move || encode_full_v2(&store, &passphrase, FULL_KDF_ITERATIONS_V2))
+        .await
+        .map_err(|e| format!("Backup encryption task failed: {e}"))?
+        .map_err(|e| e.to_string())
+}
+
+/// Key derivation and decryption run on the blocking pool for the same reason.
+async fn decode_full_blocking(
+    bytes: Vec<u8>,
+    passphrase: Option<String>,
+) -> Result<AccountsStore, String> {
+    tokio::task::spawn_blocking(move || decode_full(&bytes, passphrase.as_deref()))
+        .await
+        .map_err(|e| format!("Backup decryption task failed: {e}"))?
+        .map_err(|e| e.to_string())
 }
 
 /// Import full account config from an encrypted file, skipping existing accounts.
@@ -300,7 +321,7 @@ pub async fn import_accounts_full_encrypted_file(
     passphrase: Option<String>,
 ) -> Result<ImportAccountsSummary, String> {
     let encrypted = read_encrypted_file(&path).map_err(|e| e.to_string())?;
-    let imported = decode_full(&encrypted, passphrase.as_deref()).map_err(|e| e.to_string())?;
+    let imported = decode_full_blocking(encrypted, passphrase).await?;
     validate_imported_store(&imported).map_err(|e| e.to_string())?;
 
     mutate_accounts(|current| {
@@ -316,7 +337,7 @@ pub async fn import_accounts_full_encrypted_bytes(
     bytes: Vec<u8>,
     passphrase: Option<String>,
 ) -> Result<ImportAccountsSummary, String> {
-    let imported = decode_full(&bytes, passphrase.as_deref()).map_err(|e| e.to_string())?;
+    let imported = decode_full_blocking(bytes, passphrase).await?;
     validate_imported_store(&imported).map_err(|e| e.to_string())?;
 
     mutate_accounts(|current| {
@@ -996,9 +1017,24 @@ mod backup_tests {
         }
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn imports_run_under_store_lock_without_deadlock() {
-        let home = TestHome::new();
+    /// The body runs on its own thread (with its own TestHome and runtime) so a
+    /// sync-lock deadlock fails the test via `recv_timeout` instead of hanging it.
+    #[test]
+    fn imports_run_under_store_lock_without_deadlock() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = std::panic::catch_unwind(imports_body);
+            let _ = tx.send(outcome.map_err(|_| "import body panicked".to_string()));
+        });
+        match rx.recv_timeout(Duration::from_secs(60)) {
+            Ok(Ok(())) => {}
+            Ok(Err(message)) => panic!("{message}"),
+            Err(_) => panic!("deadlock: imports did not finish in time"),
+        }
+    }
+
+    fn imports_body() {
+        let _home = TestHome::new();
         crate::auth::seed_accounts_for_test(&api_key_store("seed")).unwrap();
 
         let bytes_blob = v2_blob("imported-bytes");
@@ -1009,7 +1045,11 @@ mod backup_tests {
         fs::write(&file_path, &file_blob).unwrap();
         let slim = encode_slim_payload_from_store(&api_key_store("imported-slim")).unwrap();
 
-        let work = async {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (a, b, c, again) = runtime.block_on(async {
             let a =
                 import_accounts_full_encrypted_bytes(bytes_blob.clone(), Some(PASS.to_string()))
                     .await
@@ -1025,16 +1065,12 @@ mod backup_tests {
                 .await
                 .unwrap();
             (a, b, c, again)
-        };
-        let (a, b, c, again) = tokio::time::timeout(Duration::from_secs(20), work)
-            .await
-            .expect("imports deadlocked");
+        });
         assert_eq!(a.imported_count, 1);
         assert_eq!(b.imported_count, 1);
         assert_eq!(c.imported_count, 1);
         assert_eq!(again.imported_count, 0);
         assert_eq!(again.skipped_count, 1);
         assert_eq!(load_accounts().unwrap().accounts.len(), 4);
-        drop(home);
     }
 }
