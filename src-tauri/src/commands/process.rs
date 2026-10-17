@@ -1326,10 +1326,19 @@ fn find_windows_codex_shortcuts() -> Vec<std::path::PathBuf> {
 
 #[cfg(windows)]
 fn open_windows_shortcut(path: &std::path::Path) -> bool {
-    let mut command = Command::new("cmd.exe");
-    command.creation_flags(CREATE_NO_WINDOW);
-    command.arg("/C").arg("start").arg("").arg(path);
-    command_succeeds(&mut command)
+    // Launch via an absolute explorer.exe path (no PATH lookup, no cmd.exe).
+    // The exit code is deliberately ignored: explorer.exe commonly exits with 1
+    // even when it opened the shortcut, so checking it (as `command_succeeds`
+    // does) would make the caller try every candidate shortcut.
+    let explorer = std::env::var_os("SystemRoot")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"))
+        .join("explorer.exe");
+    Command::new(explorer)
+        .arg(path)
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .is_ok()
 }
 
 #[cfg(windows)]
