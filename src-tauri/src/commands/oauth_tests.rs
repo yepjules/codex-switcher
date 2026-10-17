@@ -1,6 +1,6 @@
 use super::*;
-use crate::auth::test_support::TestHome;
 use crate::auth::storage::seed_accounts_for_test;
+use crate::auth::test_support::TestHome;
 use crate::auth::{get_accounts_file, get_codex_auth_file, switch_to_account};
 use crate::types::{AccountsStore, AuthData, StoredAccount};
 use std::fs;
