@@ -28,6 +28,35 @@ impl TestHome {
         TEST_HOME.with(|home| *home.borrow_mut() = Some(root.clone()));
         Self { root }
     }
+
+    /// Handle that lets another thread use this same fake home.
+    pub(crate) fn share(&self) -> SharedTestHome {
+        SharedTestHome {
+            root: self.root.clone(),
+        }
+    }
+}
+
+/// Send-able handle to a `TestHome` root; install it on a worker thread.
+pub(crate) struct SharedTestHome {
+    root: PathBuf,
+}
+
+impl SharedTestHome {
+    pub(crate) fn install(&self) -> SharedGuard {
+        assert!(home_dir().is_err(), "thread already has a test home");
+        TEST_HOME.with(|home| *home.borrow_mut() = Some(self.root.clone()));
+        SharedGuard
+    }
+}
+
+/// Clears the thread-local home on drop; never deletes anything.
+pub(crate) struct SharedGuard;
+
+impl Drop for SharedGuard {
+    fn drop(&mut self) {
+        TEST_HOME.with(|home| *home.borrow_mut() = None);
+    }
 }
 
 impl Drop for TestHome {

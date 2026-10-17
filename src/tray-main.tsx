@@ -3,6 +3,7 @@ import ReactDOM from "react-dom/client";
 import TrayMenu from "./TrayMenu";
 import { syncThemeFromStorage } from "./lib/theme";
 import "./App.css";
+import "./tray.css";
 
 syncThemeFromStorage();
 

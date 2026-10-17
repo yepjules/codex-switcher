@@ -6,6 +6,72 @@ export function isTauriRuntime(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
 
+export const WEB_TOKEN_STORAGE_KEY = "codexSwitcherWebToken";
+
+const WEB_AUTH_ERROR =
+  "Web access token missing or invalid \u2014 reopen the URL printed by codex-web";
+
+export function extractTokenFromHash(hash: string): string | null {
+  const params = new URLSearchParams(hash.startsWith("#") ? hash.slice(1) : hash);
+  const token = params.get("token");
+  return token ? token : null;
+}
+
+export function webAuthErrorMessage(status: number): string | null {
+  return status === 401 ? WEB_AUTH_ERROR : null;
+}
+
+export function isValidNewPassphrase(p: string): boolean {
+  return [...p].length >= 12;
+}
+
+let memoryWebToken: string | null = null;
+
+function readStoredWebToken(): string | null {
+  try {
+    const stored = globalThis.sessionStorage?.getItem(WEB_TOKEN_STORAGE_KEY);
+    if (stored) return stored;
+  } catch {
+    // Storage unavailable (privacy mode); use the in-memory copy.
+  }
+  return memoryWebToken;
+}
+
+export function captureWebTokenFromLocation(
+  loc: { hash: string; pathname: string; search: string },
+  history: { replaceState(data: unknown, unused: string, url?: string | null): void },
+  storage: { setItem(key: string, value: string): void } | null | undefined
+): void {
+  if (!loc.hash.includes("token=")) return;
+  const token = extractTokenFromHash(loc.hash);
+  if (token) {
+    memoryWebToken = token;
+    try {
+      storage?.setItem(WEB_TOKEN_STORAGE_KEY, token);
+    } catch {
+      // Storage unavailable; the in-memory copy still authenticates this page.
+    }
+  }
+  try {
+    history.replaceState(null, "", loc.pathname + loc.search);
+  } catch {
+    // Ignore history failures.
+  }
+}
+
+function captureWebTokenFromUrl(): void {
+  if (typeof window === "undefined" || isTauriRuntime()) return;
+  let storage: Storage | null = null;
+  try {
+    storage = window.sessionStorage;
+  } catch {
+    storage = null;
+  }
+  captureWebTokenFromLocation(window.location, window.history, storage);
+}
+
+captureWebTokenFromUrl();
+
 export async function invokeBackend<T>(
   command: string,
   args?: Record<string, unknown>
@@ -15,18 +81,23 @@ export async function invokeBackend<T>(
     return invoke<T>(command, args);
   }
 
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  const token = readStoredWebToken();
+  if (token) headers.Authorization = `Bearer ${token}`;
+
   const response = await fetch(`/api/invoke/${command}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers,
     body: JSON.stringify(args ?? {}),
   });
 
   const payload = await readJsonResponse(response);
   if (!response.ok) {
     const message =
-      typeof payload?.error === "string"
+      webAuthErrorMessage(response.status) ??
+      (typeof payload?.error === "string"
         ? payload.error
-        : `Request failed with status ${response.status}`;
+        : `Request failed with status ${response.status}`);
     throw new Error(message);
   }
 
@@ -59,7 +130,7 @@ export async function pickAuthJsonFile(): Promise<FileSource | null> {
   return pickBrowserFile(".json,application/json");
 }
 
-export async function exportFullBackupFile(): Promise<boolean> {
+export async function exportFullBackupFile(passphrase: string): Promise<boolean> {
   if (isTauriRuntime()) {
     const { save } = await import("@tauri-apps/plugin-dialog");
     const selected = await save({
@@ -69,11 +140,13 @@ export async function exportFullBackupFile(): Promise<boolean> {
     });
 
     if (!selected) return false;
-    await invokeBackend("export_accounts_full_encrypted_file", { path: selected });
+    await invokeBackend("export_accounts_full_encrypted_file", { path: selected, passphrase });
     return true;
   }
 
-  const contentsBase64 = await invokeBackend<string>("export_accounts_full_encrypted_bytes");
+  const contentsBase64 = await invokeBackend<string>("export_accounts_full_encrypted_bytes", {
+    passphrase,
+  });
   downloadBase64File(
     contentsBase64,
     "codex-switcher-full.cswf",
@@ -82,7 +155,7 @@ export async function exportFullBackupFile(): Promise<boolean> {
   return true;
 }
 
-export async function importFullBackupFile(): Promise<ImportAccountsSummary | null> {
+export async function importFullBackupFile(passphrase?: string): Promise<ImportAccountsSummary | null> {
   if (isTauriRuntime()) {
     const { open } = await import("@tauri-apps/plugin-dialog");
     const selected = await open({
@@ -94,6 +167,7 @@ export async function importFullBackupFile(): Promise<ImportAccountsSummary | nu
     if (!selected || Array.isArray(selected)) return null;
     return invokeBackend<ImportAccountsSummary>("import_accounts_full_encrypted_file", {
       path: selected,
+      passphrase: passphrase || null,
     });
   }
 
@@ -103,6 +177,7 @@ export async function importFullBackupFile(): Promise<ImportAccountsSummary | nu
   const contentsBase64 = await fileToBase64(selected);
   return invokeBackend<ImportAccountsSummary>("import_accounts_full_encrypted_bytes", {
     contentsBase64,
+    passphrase: passphrase || null,
   });
 }
 

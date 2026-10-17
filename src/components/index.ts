@@ -1,4 +1,5 @@
 export { AccountCard } from "./AccountCard";
+export { BackupPassphraseModal } from "./BackupPassphraseModal";
 export { UsageBar } from "./UsageBar";
 export { AddAccountModal } from "./AddAccountModal";
 export { AccountUsageStats } from "./AccountUsageStats";

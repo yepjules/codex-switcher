@@ -6,8 +6,8 @@ use chrono::Utc;
 use tokio::time::{sleep, Duration};
 
 use super::{
-    load_accounts, read_current_auth, save_accounts, switch_to_account, sync_active_account_tokens,
-    update_account_chatgpt_tokens, AUTH_OPERATION_LOCK,
+    load_accounts, mutate_accounts, read_current_auth, switch_to_account,
+    sync_active_account_tokens, update_account_chatgpt_tokens, AUTH_OPERATION_LOCK,
 };
 use crate::types::{
     parse_chatgpt_id_token_claims, AccountsStore, AuthData, AuthDotJson, StoredAccount,
@@ -156,24 +156,27 @@ fn reconcile_active_account_from_auth(
     sync_active_account_tokens(store, auth)
 }
 
-fn load_account_reconciling_live_auth(account_id: &str) -> Result<(StoredAccount, bool)> {
-    let mut store = load_accounts()?;
-    let is_active = store.active_account_id.as_deref() == Some(account_id);
+pub(crate) fn load_account_reconciling_live_auth(
+    account_id: &str,
+) -> Result<(StoredAccount, bool)> {
+    mutate_accounts(|store| {
+        let is_active = store.active_account_id.as_deref() == Some(account_id);
 
-    if is_active {
-        if let Some(auth) = read_current_auth()? {
-            if reconcile_active_account_from_auth(&mut store, account_id, &auth) {
-                save_accounts(&store)?;
+        if is_active {
+            // Sync file I/O only; no `.await` inside the store lock.
+            if let Some(auth) = read_current_auth()? {
+                reconcile_active_account_from_auth(store, account_id, &auth);
             }
         }
-    }
 
-    let account = store
-        .accounts
-        .into_iter()
-        .find(|stored| stored.id == account_id)
-        .context("Account not found")?;
-    Ok((account, is_active))
+        let account = store
+            .accounts
+            .iter()
+            .find(|stored| stored.id == account_id)
+            .context("Account not found")?
+            .clone();
+        Ok((account, is_active))
+    })
 }
 
 /// Build a new ChatGPT account from a refresh token.
@@ -287,7 +290,7 @@ fn parse_jwt_exp(token: &str) -> Option<i64> {
 }
 
 async fn refresh_tokens_with_refresh_token(refresh_token: &str) -> Result<RefreshTokenResponse> {
-    let client = reqwest::Client::new();
+    let client = crate::api::http::http_client();
     let body = format!(
         "grant_type=refresh_token&refresh_token={}&client_id={}",
         urlencoding::encode(refresh_token),

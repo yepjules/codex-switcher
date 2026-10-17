@@ -1,6 +1,7 @@
 use super::*;
+use crate::auth::storage::seed_accounts_for_test;
 use crate::auth::test_support::TestHome;
-use crate::auth::{get_accounts_file, get_codex_auth_file, save_accounts, switch_to_account};
+use crate::auth::{get_accounts_file, get_codex_auth_file, switch_to_account};
 use crate::types::{AccountsStore, AuthData, StoredAccount};
 use std::fs;
 
@@ -35,7 +36,7 @@ async fn adding_oauth_account_preserves_active_account_and_live_auth() {
     let _home = TestHome::new();
     let mut active = account("A");
     active.last_used_at = Some("2026-01-01T00:00:00Z".parse().unwrap());
-    save_accounts(&AccountsStore {
+    seed_accounts_for_test(&AccountsStore {
         accounts: vec![active.clone()],
         active_account_id: Some(active.id.clone()),
         ..AccountsStore::default()
@@ -96,7 +97,7 @@ async fn adding_first_oauth_account_does_not_activate_or_create_auth() {
 async fn adding_oauth_account_preserves_no_active_account_and_external_auth() {
     let _lock = OAUTH_TEST_LOCK.lock().await;
     let _home = TestHome::new();
-    save_accounts(&AccountsStore {
+    seed_accounts_for_test(&AccountsStore {
         accounts: vec![account("saved")],
         ..AccountsStore::default()
     })
@@ -122,7 +123,7 @@ async fn duplicate_or_failed_oauth_login_leaves_storage_and_auth_unchanged() {
     let _lock = OAUTH_TEST_LOCK.lock().await;
     let _home = TestHome::new();
     let active = account("A");
-    save_accounts(&AccountsStore {
+    seed_accounts_for_test(&AccountsStore {
         accounts: vec![active.clone()],
         active_account_id: Some(active.id.clone()),
         ..AccountsStore::default()

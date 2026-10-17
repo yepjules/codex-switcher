@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use chrono::Utc;
 
+use super::secure_fs::write_private_file;
 use crate::types::{
     parse_chatgpt_id_token_claims, AuthData, AuthDotJson, StoredAccount, TokenData,
 };
@@ -38,26 +39,15 @@ pub fn get_codex_auth_file() -> Result<PathBuf> {
 pub fn switch_to_account(account: &StoredAccount) -> Result<()> {
     let codex_home = get_codex_home()?;
 
-    // Ensure the codex home directory exists
-    fs::create_dir_all(&codex_home)
-        .with_context(|| format!("Failed to create codex home: {}", codex_home.display()))?;
-
     let auth_json = create_auth_json(account)?;
 
     let auth_path = codex_home.join("auth.json");
     let content =
         serde_json::to_string_pretty(&auth_json).context("Failed to serialize auth.json")?;
 
-    fs::write(&auth_path, content)
+    // Creates ~/.codex if missing; never chmods it (Codex CLI owns that directory).
+    write_private_file(&auth_path, content.as_bytes())
         .with_context(|| format!("Failed to write auth.json: {}", auth_path.display()))?;
-
-    // Set restrictive permissions on Unix
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = fs::Permissions::from_mode(0o600);
-        fs::set_permissions(&auth_path, perms)?;
-    }
 
     Ok(())
 }

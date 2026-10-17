@@ -3,7 +3,7 @@
 use crate::auth::{
     add_account, create_chatgpt_account_from_refresh_token, ensure_chatgpt_tokens_fresh_locked,
     get_active_account, import_from_auth_json, import_from_auth_json_contents, load_accounts,
-    read_current_auth, remove_account, save_accounts, set_active_account, switch_to_account,
+    mutate_accounts, read_current_auth, remove_account, set_active_account, switch_to_account,
     sync_active_account_tokens, touch_account, AUTH_OPERATION_LOCK,
 };
 use crate::types::{AccountInfo, AccountsStore, AuthData, ImportAccountsSummary, StoredAccount};
@@ -13,7 +13,7 @@ use super::process::ensure_codex_not_running;
 use anyhow::Context;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chacha20poly1305::{
-    aead::{Aead, KeyInit},
+    aead::{Aead, KeyInit, Payload},
     XChaCha20Poly1305, XNonce,
 };
 use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
@@ -37,11 +37,21 @@ const SLIM_AUTH_API_KEY: u8 = 0;
 const SLIM_AUTH_CHATGPT: u8 = 1;
 
 const FULL_FILE_MAGIC: &[u8; 4] = b"CSWF";
-const FULL_FILE_VERSION: u8 = 1;
+const FULL_FILE_VERSION_V1: u8 = 1;
+const FULL_FILE_VERSION_V2: u8 = 2;
 const FULL_SALT_LEN: usize = 16;
 const FULL_NONCE_LEN: usize = 24;
-const FULL_KDF_ITERATIONS: u32 = 210_000;
-const FULL_PRESET_PASSPHRASE: &str = "gT7kQ9mV2xN4pL8sR1dH6zW3cB5yF0uJ_aE7nK2tP9vM4rX1";
+const FULL_KDF_ITERATIONS_V1: u32 = 210_000;
+const FULL_KDF_ITERATIONS_V2: u32 = 600_000;
+const MIN_KDF_ITERATIONS: u32 = 100_000;
+const MAX_KDF_ITERATIONS: u32 = 2_000_000;
+const MIN_PASSPHRASE_CHARS: usize = 12;
+/// v1 header: magic(4) + version(1) + salt + nonce.
+const FULL_V1_HEADER_LEN: usize = 4 + 1 + FULL_SALT_LEN + FULL_NONCE_LEN;
+/// v2 header: magic(4) + version(1) + iterations(4) + salt + nonce; passed as AEAD AAD.
+const FULL_V2_HEADER_LEN: usize = 4 + 1 + 4 + FULL_SALT_LEN + FULL_NONCE_LEN;
+/// Read-only compatibility for v1 backups; never used for new exports.
+const LEGACY_V1_PASSPHRASE: &str = "gT7kQ9mV2xN4pL8sR1dH6zW3cB5yF0uJ_aE7nK2tP9vM4rX1";
 
 const MAX_IMPORT_JSON_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_IMPORT_FILE_BYTES: u64 = 8 * 1024 * 1024;
@@ -140,7 +150,7 @@ pub async fn switch_account(account_id: String) -> Result<(), String> {
 
 pub async fn switch_account_by_id(account_id: &str) -> Result<(), String> {
     let _auth_guard = AUTH_OPERATION_LOCK.lock().await;
-    let mut store = load_accounts().map_err(|e| e.to_string())?;
+    let store = load_accounts().map_err(|e| e.to_string())?;
 
     let target_index = store
         .accounts
@@ -156,13 +166,19 @@ pub async fn switch_account_by_id(account_id: &str) -> Result<(), String> {
 
     // ChatGPT rotates single-use refresh tokens. Preserve the latest token
     // before replacing auth.json, otherwise switching back restores a stale one.
+    let mut target = store.accounts[target_index].clone();
     if let Some(auth) = read_current_auth().map_err(|e| e.to_string())? {
-        if sync_active_account_tokens(&mut store, &auth) {
-            save_accounts(&store).map_err(|e| e.to_string())?;
+        let refreshed_target = mutate_accounts(|store| {
+            sync_active_account_tokens(store, &auth);
+            Ok(store.accounts.iter().find(|a| a.id == account_id).cloned())
+        })
+        .map_err(|e| e.to_string())?;
+        if let Some(refreshed_target) = refreshed_target {
+            target = refreshed_target;
         }
     }
 
-    let account = ensure_chatgpt_tokens_fresh_locked(&store.accounts[target_index])
+    let account = ensure_chatgpt_tokens_fresh_locked(&target)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -201,6 +217,8 @@ pub async fn switch_account_by_id(account_id: &str) -> Result<(), String> {
 /// Remove an account
 #[tauri::command]
 pub async fn delete_account(account_id: String) -> Result<(), String> {
+    // Serialize with switch_account so auth.json is never written for a deleted account.
+    let _auth_guard = AUTH_OPERATION_LOCK.lock().await;
     remove_account(&account_id).map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -239,8 +257,14 @@ pub async fn import_accounts_slim_text(payload: String) -> Result<ImportAccounts
         })?;
     validate_imported_store(&imported).map_err(|e| format!("{e:#}"))?;
 
-    let (merged, summary) = merge_accounts_store(current, imported);
-    save_accounts(&merged).map_err(|e| e.to_string())?;
+    // `existing_names` came from a pre-network snapshot; the merge re-checks
+    // duplicates against the fresh store under the lock, so that is safe.
+    let summary = mutate_accounts(|current| {
+        let (merged, summary) = merge_accounts_store(std::mem::take(current), imported);
+        *current = merged;
+        Ok(summary)
+    })
+    .map_err(|e| e.to_string())?;
     Ok(ImportAccountsSummary {
         total_in_payload,
         imported_count: summary.imported_count,
@@ -250,48 +274,78 @@ pub async fn import_accounts_slim_text(payload: String) -> Result<ImportAccounts
 
 /// Export full account config as an encrypted file.
 #[tauri::command]
-pub async fn export_accounts_full_encrypted_file(path: String) -> Result<(), String> {
+pub async fn export_accounts_full_encrypted_file(
+    path: String,
+    passphrase: String,
+) -> Result<(), String> {
+    validate_new_passphrase(&passphrase).map_err(|e| e.to_string())?;
     let store = load_accounts().map_err(|e| e.to_string())?;
-    let encrypted =
-        encode_full_encrypted_store(&store, FULL_PRESET_PASSPHRASE).map_err(|e| e.to_string())?;
+    let encrypted = encode_full_v2_blocking(store, passphrase).await?;
     write_encrypted_file(&path, &encrypted).map_err(|e| e.to_string())?;
     Ok(())
 }
 
 /// Export full account config as encrypted bytes for browser clients.
-pub async fn export_accounts_full_encrypted_bytes() -> Result<Vec<u8>, String> {
+pub async fn export_accounts_full_encrypted_bytes(passphrase: String) -> Result<Vec<u8>, String> {
+    validate_new_passphrase(&passphrase).map_err(|e| e.to_string())?;
     let store = load_accounts().map_err(|e| e.to_string())?;
-    encode_full_encrypted_store(&store, FULL_PRESET_PASSPHRASE).map_err(|e| e.to_string())
+    encode_full_v2_blocking(store, passphrase).await
+}
+
+/// PBKDF2 at 600k iterations is CPU-heavy; keep it off the async worker threads.
+async fn encode_full_v2_blocking(
+    store: AccountsStore,
+    passphrase: String,
+) -> Result<Vec<u8>, String> {
+    tokio::task::spawn_blocking(move || encode_full_v2(&store, &passphrase, FULL_KDF_ITERATIONS_V2))
+        .await
+        .map_err(|e| format!("Backup encryption task failed: {e}"))?
+        .map_err(|e| e.to_string())
+}
+
+/// Key derivation and decryption run on the blocking pool for the same reason.
+async fn decode_full_blocking(
+    bytes: Vec<u8>,
+    passphrase: Option<String>,
+) -> Result<AccountsStore, String> {
+    tokio::task::spawn_blocking(move || decode_full(&bytes, passphrase.as_deref()))
+        .await
+        .map_err(|e| format!("Backup decryption task failed: {e}"))?
+        .map_err(|e| e.to_string())
 }
 
 /// Import full account config from an encrypted file, skipping existing accounts.
 #[tauri::command]
 pub async fn import_accounts_full_encrypted_file(
     path: String,
+    passphrase: Option<String>,
 ) -> Result<ImportAccountsSummary, String> {
     let encrypted = read_encrypted_file(&path).map_err(|e| e.to_string())?;
-    let imported = decode_full_encrypted_store(&encrypted, FULL_PRESET_PASSPHRASE)
-        .map_err(|e| e.to_string())?;
+    let imported = decode_full_blocking(encrypted, passphrase).await?;
     validate_imported_store(&imported).map_err(|e| e.to_string())?;
 
-    let current = load_accounts().map_err(|e| e.to_string())?;
-    let (merged, summary) = merge_accounts_store(current, imported);
-    save_accounts(&merged).map_err(|e| e.to_string())?;
-    Ok(summary)
+    mutate_accounts(|current| {
+        let (merged, summary) = merge_accounts_store(std::mem::take(current), imported);
+        *current = merged;
+        Ok(summary)
+    })
+    .map_err(|e| e.to_string())
 }
 
 /// Import full account config from encrypted bytes uploaded through the browser UI.
 pub async fn import_accounts_full_encrypted_bytes(
     bytes: Vec<u8>,
+    passphrase: Option<String>,
 ) -> Result<ImportAccountsSummary, String> {
-    let imported =
-        decode_full_encrypted_store(&bytes, FULL_PRESET_PASSPHRASE).map_err(|e| e.to_string())?;
+    let imported = decode_full_blocking(bytes, passphrase).await?;
     validate_imported_store(&imported).map_err(|e| e.to_string())?;
 
-    let current = load_accounts().map_err(|e| e.to_string())?;
-    let (merged, summary) = merge_accounts_store(current, imported);
-    save_accounts(&merged).map_err(|e| e.to_string())?;
-    Ok(summary)
+    mutate_accounts(|current| {
+        let (merged, summary) = merge_accounts_store(std::mem::take(current), imported);
+        *current = merged;
+        Ok(summary)
+    })
+    .map_err(|e| e.to_string())
 }
 
 /// Find all running Antigravity codex assistant processes
@@ -556,7 +610,21 @@ async fn restore_slim_accounts(
     Ok(restored)
 }
 
-fn encode_full_encrypted_store(store: &AccountsStore, passphrase: &str) -> anyhow::Result<Vec<u8>> {
+/// The passphrase must be at least `MIN_PASSPHRASE_CHARS` Unicode scalar values.
+fn validate_new_passphrase(passphrase: &str) -> anyhow::Result<()> {
+    if passphrase.chars().count() < MIN_PASSPHRASE_CHARS {
+        anyhow::bail!("Passphrase must be at least {MIN_PASSPHRASE_CHARS} characters");
+    }
+    Ok(())
+}
+
+/// v2 layout: "CSWF" | 0x02 | iterations u32 BE | salt[16] | nonce[24] | ciphertext.
+/// The 49-byte header is bound to the ciphertext as AEAD associated data.
+fn encode_full_v2(
+    store: &AccountsStore,
+    passphrase: &str,
+    iterations: u32,
+) -> anyhow::Result<Vec<u8>> {
     let json = serde_json::to_vec(store).context("Failed to serialize account store")?;
     let compressed = compress_bytes(&json).context("Failed to compress account store")?;
 
@@ -566,32 +634,36 @@ fn encode_full_encrypted_store(store: &AccountsStore, passphrase: &str) -> anyho
     let mut nonce = [0u8; FULL_NONCE_LEN];
     rand::rng().fill_bytes(&mut nonce);
 
-    let key = derive_encryption_key(passphrase, &salt);
-    let cipher = XChaCha20Poly1305::new((&key).into());
-    let ciphertext = cipher
-        .encrypt(XNonce::from_slice(&nonce), compressed.as_slice())
-        .map_err(|_| anyhow::anyhow!("Failed to encrypt account store"))?;
-
-    let mut out = Vec::with_capacity(4 + 1 + FULL_SALT_LEN + FULL_NONCE_LEN + ciphertext.len());
+    let mut out = Vec::with_capacity(FULL_V2_HEADER_LEN + compressed.len() + 16);
     out.extend_from_slice(FULL_FILE_MAGIC);
-    out.push(FULL_FILE_VERSION);
+    out.push(FULL_FILE_VERSION_V2);
+    out.extend_from_slice(&iterations.to_be_bytes());
     out.extend_from_slice(&salt);
     out.extend_from_slice(&nonce);
+    debug_assert_eq!(out.len(), FULL_V2_HEADER_LEN);
+
+    let key = derive_encryption_key(passphrase, &salt, iterations);
+    let cipher = XChaCha20Poly1305::new((&key).into());
+    let ciphertext = cipher
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: compressed.as_slice(),
+                aad: &out[..FULL_V2_HEADER_LEN],
+            },
+        )
+        .map_err(|_| anyhow::anyhow!("Failed to encrypt account store"))?;
     out.extend_from_slice(&ciphertext);
 
     Ok(out)
 }
 
-fn decode_full_encrypted_store(
-    file_bytes: &[u8],
-    passphrase: &str,
-) -> anyhow::Result<AccountsStore> {
+fn decode_full(file_bytes: &[u8], passphrase: Option<&str>) -> anyhow::Result<AccountsStore> {
     if file_bytes.len() as u64 > MAX_IMPORT_FILE_BYTES {
         anyhow::bail!("Encrypted file is too large");
     }
 
-    let header_len = 4 + 1 + FULL_SALT_LEN + FULL_NONCE_LEN;
-    if file_bytes.len() <= header_len {
+    if file_bytes.len() < 5 {
         anyhow::bail!("Encrypted file is invalid or truncated");
     }
 
@@ -599,26 +671,51 @@ fn decode_full_encrypted_store(
         anyhow::bail!("Encrypted file header is invalid");
     }
 
-    let version = file_bytes[4];
-    if version != FULL_FILE_VERSION {
-        anyhow::bail!("Unsupported encrypted file version: {version}");
-    }
-
-    let salt_start = 5;
-    let nonce_start = salt_start + FULL_SALT_LEN;
-    let ciphertext_start = nonce_start + FULL_NONCE_LEN;
-
-    let salt = &file_bytes[salt_start..nonce_start];
-    let nonce = &file_bytes[nonce_start..ciphertext_start];
-    let ciphertext = &file_bytes[ciphertext_start..];
-
-    let key = derive_encryption_key(passphrase, salt);
-    let cipher = XChaCha20Poly1305::new((&key).into());
-    let compressed = cipher
-        .decrypt(XNonce::from_slice(nonce), ciphertext)
-        .map_err(|_| {
-            anyhow::anyhow!("Failed to decrypt file (wrong passphrase or corrupted file)")
-        })?;
+    let compressed = match file_bytes[4] {
+        FULL_FILE_VERSION_V1 => {
+            if file_bytes.len() <= FULL_V1_HEADER_LEN {
+                anyhow::bail!("Encrypted file is invalid or truncated");
+            }
+            let salt = &file_bytes[5..5 + FULL_SALT_LEN];
+            let nonce = &file_bytes[5 + FULL_SALT_LEN..FULL_V1_HEADER_LEN];
+            let ciphertext = &file_bytes[FULL_V1_HEADER_LEN..];
+            let key = derive_encryption_key(LEGACY_V1_PASSPHRASE, salt, FULL_KDF_ITERATIONS_V1);
+            decrypt_payload(
+                &key,
+                nonce,
+                Payload {
+                    msg: ciphertext,
+                    aad: &[],
+                },
+            )?
+        }
+        FULL_FILE_VERSION_V2 => {
+            if file_bytes.len() <= FULL_V2_HEADER_LEN {
+                anyhow::bail!("Encrypted file is invalid or truncated");
+            }
+            let passphrase = passphrase
+                .filter(|p| !p.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("This backup is passphrase-protected"))?;
+            let iterations =
+                u32::from_be_bytes([file_bytes[5], file_bytes[6], file_bytes[7], file_bytes[8]]);
+            if !(MIN_KDF_ITERATIONS..=MAX_KDF_ITERATIONS).contains(&iterations) {
+                anyhow::bail!("Encrypted file header is invalid");
+            }
+            let salt = &file_bytes[9..9 + FULL_SALT_LEN];
+            let nonce = &file_bytes[9 + FULL_SALT_LEN..FULL_V2_HEADER_LEN];
+            let ciphertext = &file_bytes[FULL_V2_HEADER_LEN..];
+            let key = derive_encryption_key(passphrase, salt, iterations);
+            decrypt_payload(
+                &key,
+                nonce,
+                Payload {
+                    msg: ciphertext,
+                    aad: &file_bytes[..FULL_V2_HEADER_LEN],
+                },
+            )?
+        }
+        version => anyhow::bail!("Unsupported encrypted file version: {version}"),
+    };
 
     let json = decompress_bytes_with_limit(&compressed, MAX_IMPORT_JSON_BYTES)
         .context("Failed to decompress decrypted payload")?;
@@ -629,9 +726,20 @@ fn decode_full_encrypted_store(
     Ok(store)
 }
 
-fn derive_encryption_key(passphrase: &str, salt: &[u8]) -> [u8; 32] {
+fn decrypt_payload(
+    key: &[u8; 32],
+    nonce: &[u8],
+    payload: Payload<'_, '_>,
+) -> anyhow::Result<Vec<u8>> {
+    let cipher = XChaCha20Poly1305::new(key.into());
+    cipher
+        .decrypt(XNonce::from_slice(nonce), payload)
+        .map_err(|_| anyhow::anyhow!("Failed to decrypt file (wrong passphrase or corrupted file)"))
+}
+
+fn derive_encryption_key(passphrase: &str, salt: &[u8], iterations: u32) -> [u8; 32] {
     let mut key = [0u8; 32];
-    pbkdf2_hmac::<Sha256>(passphrase.as_bytes(), salt, FULL_KDF_ITERATIONS, &mut key);
+    pbkdf2_hmac::<Sha256>(passphrase.as_bytes(), salt, iterations, &mut key);
     key
 }
 
@@ -655,16 +763,8 @@ fn decompress_bytes_with_limit(input: &[u8], max_bytes: u64) -> anyhow::Result<V
 }
 
 fn write_encrypted_file(path: &str, bytes: &[u8]) -> anyhow::Result<()> {
-    fs::write(path, bytes).with_context(|| format!("Failed to write file: {path}"))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("Failed to set file permissions: {path}"))?;
-    }
-
-    Ok(())
+    crate::auth::secure_fs::write_private_file(std::path::Path::new(path), bytes)
+        .with_context(|| format!("Failed to write file: {path}"))
 }
 
 fn read_encrypted_file(path: &str) -> anyhow::Result<Vec<u8>> {
@@ -705,7 +805,7 @@ fn validate_imported_store(store: &AccountsStore) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn merge_accounts_store(
+pub(crate) fn merge_accounts_store(
     mut current: AccountsStore,
     imported: AccountsStore,
 ) -> (AccountsStore, ImportAccountsSummary) {
@@ -766,4 +866,211 @@ pub async fn get_masked_account_ids() -> Result<Vec<String>, String> {
 #[tauri::command]
 pub async fn set_masked_account_ids(ids: Vec<String>) -> Result<(), String> {
     crate::auth::storage::set_masked_account_ids(ids).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod backup_tests {
+    use super::*;
+    use crate::auth::test_support::TestHome;
+    use chacha20poly1305::aead::Payload;
+    use std::time::Duration;
+
+    const PASS: &str = "correct horse battery";
+    const TEST_ITERS: u32 = 100_000;
+
+    fn api_key_store(name: &str) -> AccountsStore {
+        AccountsStore {
+            accounts: vec![StoredAccount::new_api_key(
+                name.into(),
+                format!("key-{name}"),
+            )],
+            ..AccountsStore::default()
+        }
+    }
+
+    fn v2_blob(name: &str) -> Vec<u8> {
+        encode_full_v2(&api_key_store(name), PASS, TEST_ITERS).unwrap()
+    }
+
+    /// Legacy v1 layout: magic | 1 | salt | nonce | ct, no AAD.
+    fn v1_blob(store: &AccountsStore) -> Vec<u8> {
+        let json = serde_json::to_vec(store).unwrap();
+        let compressed = compress_bytes(&json).unwrap();
+        let salt = [7u8; FULL_SALT_LEN];
+        let nonce = [9u8; FULL_NONCE_LEN];
+        let key = derive_encryption_key(LEGACY_V1_PASSPHRASE, &salt, FULL_KDF_ITERATIONS_V1);
+        let cipher = XChaCha20Poly1305::new((&key).into());
+        let ct = cipher
+            .encrypt(XNonce::from_slice(&nonce), compressed.as_slice())
+            .unwrap();
+        let mut out = Vec::new();
+        out.extend_from_slice(FULL_FILE_MAGIC);
+        out.push(FULL_FILE_VERSION_V1);
+        out.extend_from_slice(&salt);
+        out.extend_from_slice(&nonce);
+        out.extend_from_slice(&ct);
+        out
+    }
+
+    fn err_text<T>(r: anyhow::Result<T>) -> String {
+        match r {
+            Ok(_) => panic!("expected error"),
+            Err(e) => format!("{e:#}"),
+        }
+    }
+
+    #[test]
+    fn v2_round_trip() {
+        let blob = v2_blob("alpha");
+        let store = decode_full(&blob, Some(PASS)).unwrap();
+        assert_eq!(store.accounts.len(), 1);
+        assert_eq!(store.accounts[0].name, "alpha");
+    }
+
+    #[test]
+    fn v2_wrong_passphrase_fails() {
+        let blob = v2_blob("alpha");
+        let msg = err_text(decode_full(&blob, Some("another long passphrase")));
+        assert!(msg.contains("wrong passphrase"), "{msg}");
+    }
+
+    #[test]
+    fn v2_missing_passphrase_fails() {
+        let blob = v2_blob("alpha");
+        for p in [None, Some("")] {
+            let msg = err_text(decode_full(&blob, p));
+            assert!(msg.contains("passphrase-protected"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn short_passphrase_rejected() {
+        let msg = err_text(validate_new_passphrase("short"));
+        assert_eq!(msg, "Passphrase must be at least 12 characters");
+        assert!(validate_new_passphrase("abcdefghijkl").is_ok());
+        assert!(validate_new_passphrase("ééééééééééé1").is_ok());
+    }
+
+    #[test]
+    fn v1_legacy_still_imports() {
+        let blob = v1_blob(&api_key_store("legacy"));
+        for p in [None, Some("")] {
+            let store = decode_full(&blob, p).unwrap();
+            assert_eq!(store.accounts[0].name, "legacy");
+        }
+    }
+
+    #[test]
+    fn v2_iterations_out_of_range_rejected() {
+        for bad in [50_000u32, 5_000_000u32] {
+            let mut blob = v2_blob("alpha");
+            blob[5..9].copy_from_slice(&bad.to_be_bytes());
+            let msg = err_text(decode_full(&blob, Some(PASS)));
+            assert!(msg.contains("header is invalid"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn v2_header_tamper_fails() {
+        let mut blob = v2_blob("alpha");
+        blob[5..9].copy_from_slice(&(TEST_ITERS + 1).to_be_bytes());
+        let msg = err_text(decode_full(&blob, Some(PASS)));
+        assert!(msg.contains("wrong passphrase"), "{msg}");
+    }
+
+    #[test]
+    fn v2_header_is_bound_as_aad() {
+        let blob = v2_blob("alpha");
+        let iters = u32::from_be_bytes(blob[5..9].try_into().unwrap());
+        let salt = &blob[9..25];
+        let nonce = &blob[25..49];
+        let key = derive_encryption_key(PASS, salt, iters);
+        let cipher = XChaCha20Poly1305::new((&key).into());
+        let ct = &blob[49..];
+        assert!(cipher
+            .decrypt(XNonce::from_slice(nonce), Payload { msg: ct, aad: &[] })
+            .is_err());
+        assert!(cipher
+            .decrypt(
+                XNonce::from_slice(nonce),
+                Payload {
+                    msg: ct,
+                    aad: &blob[..49]
+                }
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn truncated_inputs_error_without_panic() {
+        let v2 = v2_blob("alpha");
+        for len in 0..=60usize.min(v2.len()) {
+            assert!(decode_full(&v2[..len], Some(PASS)).is_err(), "v2 len {len}");
+        }
+        for len in 45..=49 {
+            let msg = err_text(decode_full(&v2[..len], Some(PASS)));
+            assert!(msg.contains("invalid or truncated"), "{len}: {msg}");
+        }
+        let v1 = v1_blob(&api_key_store("legacy"));
+        for len in 0..=50usize.min(v1.len()) {
+            assert!(decode_full(&v1[..len], Some(PASS)).is_err(), "v1 len {len}");
+        }
+    }
+
+    /// The body runs on its own thread (with its own TestHome and runtime) so a
+    /// sync-lock deadlock fails the test via `recv_timeout` instead of hanging it.
+    #[test]
+    fn imports_run_under_store_lock_without_deadlock() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = std::panic::catch_unwind(imports_body);
+            let _ = tx.send(outcome.map_err(|_| "import body panicked".to_string()));
+        });
+        match rx.recv_timeout(Duration::from_secs(60)) {
+            Ok(Ok(())) => {}
+            Ok(Err(message)) => panic!("{message}"),
+            Err(_) => panic!("deadlock: imports did not finish in time"),
+        }
+    }
+
+    fn imports_body() {
+        let _home = TestHome::new();
+        crate::auth::seed_accounts_for_test(&api_key_store("seed")).unwrap();
+
+        let bytes_blob = v2_blob("imported-bytes");
+        let file_blob = v2_blob("imported-file");
+        let file_path = crate::auth::test_support::home_dir()
+            .unwrap()
+            .join("backup-file.bin");
+        fs::write(&file_path, &file_blob).unwrap();
+        let slim = encode_slim_payload_from_store(&api_key_store("imported-slim")).unwrap();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (a, b, c, again) = runtime.block_on(async {
+            let a =
+                import_accounts_full_encrypted_bytes(bytes_blob.clone(), Some(PASS.to_string()))
+                    .await
+                    .unwrap();
+            let b = import_accounts_full_encrypted_file(
+                file_path.to_string_lossy().into_owned(),
+                Some(PASS.to_string()),
+            )
+            .await
+            .unwrap();
+            let c = import_accounts_slim_text(slim).await.unwrap();
+            let again = import_accounts_full_encrypted_bytes(bytes_blob, Some(PASS.to_string()))
+                .await
+                .unwrap();
+            (a, b, c, again)
+        });
+        assert_eq!(a.imported_count, 1);
+        assert_eq!(b.imported_count, 1);
+        assert_eq!(c.imported_count, 1);
+        assert_eq!(again.imported_count, 0);
+        assert_eq!(again.skipped_count, 1);
+        assert_eq!(load_accounts().unwrap().accounts.len(), 4);
+    }
 }

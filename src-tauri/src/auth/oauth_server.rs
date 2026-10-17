@@ -93,7 +93,7 @@ async fn exchange_code_for_tokens(
     pkce: &PkceCodes,
     code: &str,
 ) -> Result<TokenResponse> {
-    let client = reqwest::Client::new();
+    let client = crate::api::http::http_client();
 
     let body = format!(
         "grant_type=authorization_code&code={}&redirect_uri={}&client_id={}&code_verifier={}",
@@ -252,6 +252,37 @@ async fn run_oauth_server(
     }
 }
 
+enum CallbackAction {
+    /// Respond 400 with this constant body and keep waiting.
+    Ignore(&'static str),
+    /// Terminate the login with this error.
+    Fail(String),
+    /// State verified and code present: exchange it.
+    Exchange(String),
+}
+
+/// State is verified before both the error and code branches, so a stray or
+/// forged request can neither abort the login nor inject a code.
+fn classify_callback(
+    params: &std::collections::HashMap<String, String>,
+    expected_state: &str,
+) -> CallbackAction {
+    if params.get("state").map(String::as_str) != Some(expected_state) {
+        return CallbackAction::Ignore("State mismatch");
+    }
+    if let Some(error) = params.get("error") {
+        let error_desc = params
+            .get("error_description")
+            .map(String::as_str)
+            .unwrap_or("Unknown error");
+        return CallbackAction::Fail(format!("OAuth error: {error} - {error_desc}"));
+    }
+    match params.get("code") {
+        Some(code) if !code.is_empty() => CallbackAction::Exchange(code.clone()),
+        _ => CallbackAction::Fail("Missing authorization code".to_string()),
+    }
+}
+
 enum HandleResult {
     Continue,
     Success(StoredAccount),
@@ -286,40 +317,26 @@ async fn handle_oauth_request(
             params.keys().collect::<Vec<_>>()
         );
 
-        // Check for error response
-        if let Some(error) = params.get("error") {
-            let error_desc = params
-                .get("error_description")
-                .map(|s| s.as_str())
-                .unwrap_or("Unknown error");
-            println!("[OAuth] Error from provider: {error} - {error_desc}");
-            let _ = request.respond(
-                Response::from_string(format!("OAuth Error: {error} - {error_desc}"))
-                    .with_status_code(400),
-            );
-            return HandleResult::Error(anyhow::anyhow!("OAuth error: {error} - {error_desc}"));
-        }
-
-        // Verify state
-        if params.get("state").map(String::as_str) != Some(expected_state) {
-            println!("[OAuth] State mismatch!");
-            let _ = request.respond(Response::from_string("State mismatch").with_status_code(400));
-            return HandleResult::Error(anyhow::anyhow!("OAuth state mismatch"));
-        }
+        let code = match classify_callback(&params, expected_state) {
+            CallbackAction::Ignore(body) => {
+                // Stray or forged request: keep waiting for the real callback.
+                println!("[OAuth] Ignoring callback: {body}");
+                let _ = request.respond(Response::from_string(body).with_status_code(400));
+                return HandleResult::Continue;
+            }
+            CallbackAction::Fail(msg) => {
+                println!("[OAuth] Callback failed: {msg}");
+                let body = match msg.strip_prefix("OAuth error: ") {
+                    Some(rest) => format!("OAuth Error: {rest}"),
+                    None => msg.clone(),
+                };
+                let _ = request.respond(Response::from_string(body).with_status_code(400));
+                return HandleResult::Error(anyhow::anyhow!(msg));
+            }
+            CallbackAction::Exchange(code) => code,
+        };
 
         println!("[OAuth] State verified OK");
-
-        // Get the authorization code
-        let code = match params.get("code") {
-            Some(c) if !c.is_empty() => c.clone(),
-            _ => {
-                println!("[OAuth] Missing authorization code");
-                let _ = request.respond(
-                    Response::from_string("Missing authorization code").with_status_code(400),
-                );
-                return HandleResult::Error(anyhow::anyhow!("Missing authorization code"));
-            }
-        };
 
         println!("[OAuth] Got authorization code, exchanging for tokens...");
 
@@ -394,4 +411,69 @@ pub async fn wait_for_oauth_login(
 ) -> Result<StoredAccount> {
     let result = rx.await.context("OAuth login was cancelled")??;
     Ok(result.account)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{classify_callback, CallbackAction};
+    use std::collections::HashMap;
+
+    fn params(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn assert_ignored(action: CallbackAction) {
+        assert!(matches!(action, CallbackAction::Ignore("State mismatch")));
+    }
+
+    #[test]
+    fn missing_state_with_code_is_ignored() {
+        assert_ignored(classify_callback(&params(&[("code", "abc")]), "s"));
+    }
+
+    #[test]
+    fn wrong_state_with_error_is_ignored() {
+        assert_ignored(classify_callback(
+            &params(&[("state", "bad"), ("error", "access_denied")]),
+            "s",
+        ));
+    }
+
+    #[test]
+    fn missing_state_with_error_is_ignored() {
+        assert_ignored(classify_callback(&params(&[("error", "x")]), "s"));
+    }
+
+    #[test]
+    fn right_state_with_error_fails() {
+        let action = classify_callback(
+            &params(&[("state", "s"), ("error", "x"), ("error_description", "y")]),
+            "s",
+        );
+        match action {
+            CallbackAction::Fail(msg) => assert!(msg.contains('x') && msg.contains('y')),
+            _ => panic!("expected Fail"),
+        }
+    }
+
+    #[test]
+    fn right_state_with_code_exchanges() {
+        let action = classify_callback(&params(&[("state", "s"), ("code", "abc")]), "s");
+        assert!(matches!(action, CallbackAction::Exchange(ref c) if c == "abc"));
+    }
+
+    #[test]
+    fn right_state_with_empty_code_fails() {
+        let action = classify_callback(&params(&[("state", "s"), ("code", "")]), "s");
+        assert!(matches!(action, CallbackAction::Fail(ref m) if m == "Missing authorization code"));
+    }
+
+    #[test]
+    fn right_state_without_code_or_error_fails() {
+        let action = classify_callback(&params(&[("state", "s")]), "s");
+        assert!(matches!(action, CallbackAction::Fail(ref m) if m == "Missing authorization code"));
+    }
 }

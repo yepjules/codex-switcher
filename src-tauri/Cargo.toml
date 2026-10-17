@@ -39,6 +39,7 @@ url = "2"
 flate2 = "1"
 chacha20poly1305 = "0.10"
 pbkdf2 = "0.12"
+subtle = "2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 plist = "1"
@@ -50,3 +51,10 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Securit
 # Temporary backport of tray-icon PR #365: macOS 27 can swallow left-clicks while an NSMenu stays attached.
 # Remove this entry and vendor/tray-icon-0.21.3 once Tauri resolves to tray-icon >= 0.25.1 (or another release containing that fix), then refresh Cargo.lock.
 tray-icon = { path = "vendor/tray-icon-0.21.3" }
+# Local patch of tiny_http 0.12.0 (also used by the OAuth callback server), all marked "codex-switcher patch":
+# - util/equal_reader.rs: EqualReader::drop allocated a buffer sized by the client-declared Content-Length (one unauthenticated request aborted the process); it now drains through a fixed buffer within a 16 MiB / 10 s budget.
+# - lib.rs + connection.rs: accepted sockets get 10 s read/write timeouts (DEFAULT_SOCKET_TIMEOUT; Server::http_with_timeout / from_listener_with_timeout to override), so an idle client cannot block a thread forever.
+# - request.rs: a request's leftover body is drained on a short-lived thread when the Request is dropped, not on the handler thread.
+# - client.rs + equal_reader.rs + request.rs: if a body is not fully drained (budget, timeout, EOF), the connection is poisoned and closed instead of parsing the leftover bytes as the next request (no desync/smuggling); requests with Transfer-Encoding always close the connection after the response.
+# Remove this entry and vendor/tiny_http-0.12.0 only once an upstream release covers all of the above (or web.rs moves to another server), then refresh Cargo.lock.
+tiny_http = { path = "vendor/tiny_http-0.12.0" }
