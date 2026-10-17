@@ -93,7 +93,7 @@ async fn exchange_code_for_tokens(
     pkce: &PkceCodes,
     code: &str,
 ) -> Result<TokenResponse> {
-    let client = reqwest::Client::new();
+    let client = crate::api::http::http_client();
 
     let body = format!(
         "grant_type=authorization_code&code={}&redirect_uri={}&client_id={}&code_verifier={}",
