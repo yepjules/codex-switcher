@@ -96,10 +96,11 @@ JSON API responses carry `X-Content-Type-Options: nosniff` and `Cache-Control: n
 ```
 
 - KDF: PBKDF2-HMAC-SHA256 with 600,000 iterations (OWASP 2023). No new crypto dependency.
-- The full 45-byte header (magic through nonce) is passed as AEAD associated data, so a tampered iteration count fails decryption.
+- The full 49-byte v2 header (magic through nonce: 4+1+4+16+24) is passed as AEAD associated data, so a tampered iteration count fails decryption.
+- Length checks are per version: a v2 file must be longer than 49 bytes and a v1 file longer than 45 bytes before any field is sliced, else "Encrypted file is invalid or truncated". Truncated input must never panic.
 - Iterations read from a file must be within 100,000–2,000,000, otherwise the file is rejected as "Encrypted file header is invalid". This stops a crafted file from causing a CPU DoS on the single-threaded web server.
 
-**Passphrase:** minimum 12 characters (Unicode scalar count), enforced in the backend (authoritative) and the UI.
+**Passphrase:** minimum 12 characters (Unicode scalar count), enforced in the backend (authoritative) and the UI. The UI counts with `[...passphrase].length`, not `.length`.
 
 **Export API**
 - `export_accounts_full_encrypted_file(path, passphrase)`
@@ -263,7 +264,7 @@ Backups section:
 - Removed commands → error.
 - Static response headers include CSP, nosniff, no-referrer and DENY.
 - Env token validation: under 32 chars rejected; low diversity rejected; a valid token accepted.
-- Backups: v2 round-trip; v2 wrong passphrase; v2 empty passphrase; short passphrase rejected on export; v1 legacy file (encoded with the legacy constant in-test) still imports; out-of-range iterations rejected; header tamper (iteration byte flipped) fails.
+- Backups: v2 round-trip; v2 wrong passphrase; v2 empty passphrase; short passphrase rejected on export; v1 legacy file (encoded with the legacy constant in-test) still imports; out-of-range iterations rejected; header tamper (iteration byte flipped, value still in range) fails; decrypting with empty AAD fails while decrypting with the 49-byte header succeeds (proves AAD binding).
 - `secure_fs` (unix-gated where noted):
   - file mode 0600; new dir 0700; an existing 0755 dir is tightened to 0700;
   - an existing file is replaced, and no temp file is left on success;
