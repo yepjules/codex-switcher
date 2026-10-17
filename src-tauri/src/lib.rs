@@ -29,6 +29,9 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
+            if let Err(err) = auth::harden_config_permissions() {
+                eprintln!("[Startup] Failed to harden config permissions: {err:#}");
+            }
             #[cfg(desktop)]
             {
                 app.handle()

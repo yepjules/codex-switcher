@@ -207,6 +207,8 @@ pub async fn switch_account_by_id(account_id: &str) -> Result<(), String> {
 /// Remove an account
 #[tauri::command]
 pub async fn delete_account(account_id: String) -> Result<(), String> {
+    // Serialize with switch_account so auth.json is never written for a deleted account.
+    let _auth_guard = AUTH_OPERATION_LOCK.lock().await;
     remove_account(&account_id).map_err(|e| e.to_string())?;
     Ok(())
 }

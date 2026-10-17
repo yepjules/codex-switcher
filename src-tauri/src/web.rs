@@ -79,6 +79,9 @@ struct FileImportArgs {
 }
 
 pub fn run_lan_server(host: &str, port: u16) -> anyhow::Result<()> {
+    if let Err(err) = crate::auth::harden_config_permissions() {
+        eprintln!("[Startup] Failed to harden config permissions: {err:#}");
+    }
     let address = format!("{host}:{port}");
     let server = Server::http(&address)
         .map_err(|err| anyhow::anyhow!("Failed to bind HTTP server on {address}: {err}"))?;

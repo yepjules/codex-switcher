@@ -176,6 +176,28 @@ pub fn mutate_accounts<R>(f: impl FnOnce(&mut AccountsStore) -> Result<R>) -> Re
     Ok(result)
 }
 
+/// Tighten permissions of an existing install (dir 0700, accounts.json and
+/// settings.json 0600) without waiting for the first save. Does nothing if the
+/// config dir does not exist; never touches `~/.codex`. No-op on non-Unix.
+pub fn harden_config_permissions() -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = get_config_dir()?;
+        if !dir.is_dir() {
+            return Ok(());
+        }
+        ensure_private_dir(&dir)?;
+        for file in [get_accounts_file()?, get_settings_file()?] {
+            if file.is_file() {
+                fs::set_permissions(&file, fs::Permissions::from_mode(0o600))
+                    .with_context(|| format!("Failed to restrict {}", file.display()))?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Test-only: write a store directly (bypasses the lock; for single-threaded seeding).
 #[cfg(test)]
 pub(crate) fn seed_accounts_for_test(store: &AccountsStore) -> Result<()> {
@@ -464,6 +486,35 @@ mod mutation_tests {
         mutate_accounts(|_| Ok(())).unwrap();
         let after = fs::metadata(&path).unwrap().modified().unwrap();
         assert_eq!(before, after);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn harden_config_permissions_tightens_existing_install() {
+        use std::os::unix::fs::PermissionsExt;
+        let _home = TestHome::new();
+        let dir = get_config_dir().unwrap();
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        for name in ["accounts.json", "settings.json"] {
+            let f = dir.join(name);
+            fs::write(&f, b"{}").unwrap();
+            fs::set_permissions(&f, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        harden_config_permissions().unwrap();
+
+        let mode = |p: &std::path::Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&dir.join("accounts.json")), 0o600);
+        assert_eq!(mode(&dir.join("settings.json")), 0o600);
+    }
+
+    #[test]
+    fn harden_config_permissions_missing_dir_is_ok_and_not_created() {
+        let _home = TestHome::new();
+        harden_config_permissions().unwrap();
+        assert!(!get_config_dir().unwrap().exists());
     }
 
     #[cfg(unix)]
